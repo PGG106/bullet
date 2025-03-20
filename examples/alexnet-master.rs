@@ -114,7 +114,7 @@ fn main() {
     // loading directly from a `BulletFormat` file
     //let data_loader = loader::DirectSequentialDataLoader::new(&["data/baseline.data"]);
 
-    trainer.load_from_checkpoint("checkpoints\\master-net-buckets-7-640");
+    // trainer.load_from_checkpoint("checkpoints\\master-net-buckets-7-640");
 
     //trainer.save_to_checkpoint("checkpoints\\fixed-shit");
 
