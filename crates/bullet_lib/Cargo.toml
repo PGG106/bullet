@@ -41,6 +41,10 @@ name = "morelayers"
 path = "../../examples/morelayers.rs"
 
 [[example]]
+name = "alexnet"
+path = "../../examples/alexnet-master.rs"
+
+[[example]]
 name = "akimbo-main"
 path = "../../examples/extra/akimbo-main.rs"
 
