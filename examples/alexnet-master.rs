@@ -37,7 +37,7 @@ fn main() {
     #[rustfmt::skip]
     let mut trainer = TrainerBuilder::default()
         .quantisations(&[362, 64])
-        .optimiser(optimiser::AdamW)
+        .optimiser(optimiser::Ranger)
         .loss_fn(Loss::SigmoidMPE(2.5))
         .input(inputs::ChessBucketsMirroredFactorised::new([
             0,  1,  2,  3,
@@ -61,7 +61,7 @@ fn main() {
         steps: TrainingSteps {
             batch_size: 16_384,
             batches_per_superbatch: 6104,
-            start_superbatch: 640,
+            start_superbatch: 1,
             end_superbatch: 800,
         },
         wdl_scheduler: wdl::ConstantWDL { value: 0.0 },
@@ -69,10 +69,12 @@ fn main() {
         save_rate: 80,
     };
 
-    trainer.set_optimiser_params(optimiser::AdamWParams {
+    trainer.set_optimiser_params(optimiser::RangerParams {
             decay: 0.01,
             beta1: 0.9,
             beta2: 0.999,
+            alpha: 0.5,
+            k: 6,
             min_weight: -1.414,
             max_weight: 1.414,
         });
