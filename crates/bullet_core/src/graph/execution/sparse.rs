@@ -1,14 +1,17 @@
-use crate::backend::{
-    device::{blas::Shape, Device, OperationError},
-    tensor::{DenseMatrix, SparseMatrix, Tensor},
+use crate::{
+    backend::{
+        device::{Device, OperationError},
+        tensor::{DenseMatrix, SparseMatrix, Tensor},
+    },
+    graph::ir::{op::DiffableFromOutput, shape::Shape},
 };
 
-use super::{linear_comb::backprop_add_single_scaled, Activation};
+use super::linear_comb::backprop_add_single_scaled;
 
 #[allow(clippy::too_many_arguments)]
 pub fn affine_activate<D: Device>(
     stride: Option<bool>,
-    activation: Activation,
+    activation: DiffableFromOutput,
     a: &DenseMatrix<D>,
     shape_a: Shape,
     b: &SparseMatrix<D>,
@@ -50,7 +53,7 @@ pub fn affine_activate<D: Device>(
 #[allow(clippy::too_many_arguments)]
 pub fn backprop_affine_activate<D: Device>(
     stride: Option<bool>,
-    activation: Activation,
+    activation: DiffableFromOutput,
     a: &mut Tensor<D>,
     shape_a: Shape,
     b: &SparseMatrix<D>,
@@ -130,10 +133,9 @@ pub fn affine_dual<D: Device>(
     s: &SparseMatrix<D>,
     n: &SparseMatrix<D>,
     s_shape: Shape,
-    b: &DenseMatrix<D>,
-    b_shape: Shape,
+    b: Option<(&DenseMatrix<D>, Shape)>,
     output: &mut DenseMatrix<D>,
-    activation: Activation,
+    activation: DiffableFromOutput,
 ) -> Result<(), OperationError<D::DeviceError>> {
     assert!(w.batch_size().is_none());
     assert_eq!(s.batch_size(), n.batch_size());
@@ -141,12 +143,15 @@ pub fn affine_dual<D: Device>(
     assert_eq!(w_shape.size(), w.single_size());
     assert_eq!(s_shape.size(), s.single_size());
     assert_eq!(s_shape.size(), n.single_size());
-    assert_eq!(b_shape.size(), b.single_size());
+
+    if let Some((b, b_shape)) = b {
+        assert_eq!(b_shape.size(), b.single_size());
+    }
 
     output.set_batch_size(s.batch_size())?;
 
-    affine_activate(Some(false), activation, w, w_shape, s, s_shape, Some((b, b_shape)), output)?;
-    affine_activate(Some(true), activation, w, w_shape, n, s_shape, Some((b, b_shape)), output)
+    affine_activate(Some(false), activation, w, w_shape, s, s_shape, b, output)?;
+    affine_activate(Some(true), activation, w, w_shape, n, s_shape, b, output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -159,7 +164,7 @@ pub fn backprop_affine_dual<D: Device>(
     b: &mut Option<(&mut Tensor<D>, &D::BufferF32)>,
     output: &DenseMatrix<D>,
     output_grad: &DenseMatrix<D>,
-    activation: Activation,
+    activation: DiffableFromOutput,
 ) -> Result<(), OperationError<D::DeviceError>> {
     assert_eq!(s.batch_size(), n.batch_size());
     assert_eq!(s.nnz, n.nnz);

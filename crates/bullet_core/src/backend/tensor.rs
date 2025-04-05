@@ -3,15 +3,15 @@ mod matrix;
 pub mod rng;
 mod sparse;
 
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, num::NonZeroUsize, sync::Arc};
 
-pub use dense::DenseMatrix;
+pub use dense::{read_from_byte_buffer, DenseMatrix};
 pub use matrix::Matrix;
 pub use sparse::SparseMatrix;
 
 use crate::{
     backend::device::{Device, DeviceBuffer, OperationError},
-    graph::ir::{node::AnnotatedNode, op::GraphIROp},
+    graph::ir::{op::GraphIROp, shape::Shape},
 };
 
 pub struct Tensor<D: Device> {
@@ -19,18 +19,22 @@ pub struct Tensor<D: Device> {
     pub gradients: Option<DenseMatrix<D>>,
     pub(crate) internal: HashMap<String, RefCell<DenseMatrix<D>>>,
     pub(crate) operation: Option<GraphIROp>,
-    pub(crate) own: AnnotatedNode,
+    pub(crate) idx: usize,
+    shape: Shape,
 }
 
 impl<D: Device> Tensor<D> {
     pub fn new(
         device: Arc<D>,
-        single_size: usize,
+        shape: Shape,
         requires_grad: bool,
         operation: Option<GraphIROp>,
-        own: AnnotatedNode,
+        sparse: Option<NonZeroUsize>,
+        idx: usize,
     ) -> Result<Self, D::DeviceError> {
-        let values = if let Some(nnz) = own.sparse.map(usize::from) {
+        let single_size = shape.size();
+
+        let values = if let Some(nnz) = sparse.map(usize::from) {
             Matrix::Sparse(SparseMatrix::zeroed(device.clone(), single_size, nnz)?)
         } else {
             Matrix::Dense(DenseMatrix::zeroed(device.clone(), single_size)?)
@@ -41,7 +45,8 @@ impl<D: Device> Tensor<D> {
             gradients: if requires_grad { Some(DenseMatrix::zeroed(device, single_size)?) } else { None },
             internal: HashMap::new(),
             operation,
-            own,
+            idx,
+            shape,
         })
     }
 
@@ -51,6 +56,10 @@ impl<D: Device> Tensor<D> {
         }
 
         Ok(())
+    }
+
+    pub fn shape(&self) -> Shape {
+        self.shape
     }
 
     pub fn get_scalar(&self) -> Option<f32> {

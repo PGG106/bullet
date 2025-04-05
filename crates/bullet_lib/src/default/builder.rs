@@ -1,19 +1,19 @@
 use crate::{
     default::{Layout, SavedFormat},
-    logger,
     nn::{
         optimiser::{self, OptimiserType},
         GraphCompileArgs, InitSettings, NetworkBuilder,
     },
-    trainer::save::QuantTarget,
+    trainer::{logger, save::QuantTarget},
     Activation, ExecutionContext, Shape,
 };
 
-use super::{
+use crate::game::{
     inputs::SparseInputType,
     outputs::{self, OutputBuckets},
-    AdditionalTrainerInputs, Trainer,
 };
+
+use super::{AdditionalTrainerInputs, Trainer};
 
 use bullet_core::optimiser::Optimiser;
 
@@ -25,12 +25,13 @@ pub enum Loss {
     SoftmaxCrossEntropy,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 enum OpType {
     Activate(Activation),
     ActivateDual,
     Affine,
     PairwiseMul,
+    Scale(f32),
 }
 
 struct NodeType {
@@ -198,6 +199,12 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
         self.add(size, OpType::Activate(activation))
     }
 
+    /// Multiply by `scale`
+    pub fn scale(self, scale: f32) -> Self {
+        let size = self.get_last_layer_size();
+        self.add(size, OpType::Scale(scale))
+    }
+
     /// Adds SF-style dual activation
     pub fn add_dual_activation(self) -> Self {
         let size = self.get_last_layer_size() * 2;
@@ -335,7 +342,7 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
             match op {
                 OpType::Activate(activation) => out = out.activate(activation),
                 OpType::ActivateDual => {
-                    out = out.concat(out.activate(Activation::Square)).activate(Activation::CReLU);
+                    out = out.concat(out.abs_pow(2.0)).activate(Activation::CReLU);
                     prev_size = size;
                 }
                 OpType::Affine => {
@@ -368,6 +375,7 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
 
                     prev_size /= 2;
                 }
+                OpType::Scale(x) => out = x * out,
             }
         }
 
@@ -382,8 +390,8 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
         let targets = builder.new_dense_input("targets", Shape::new(output_size, 1));
         match self.loss {
             Loss::None => panic!("No loss function specified!"),
-            Loss::SigmoidMSE => out.activate(Activation::Sigmoid).mse(targets),
-            Loss::SigmoidMPE(power) => out.activate(Activation::Sigmoid).mpe(targets, power),
+            Loss::SigmoidMSE => out.activate(Activation::Sigmoid).squared_error(targets),
+            Loss::SigmoidMPE(power) => out.activate(Activation::Sigmoid).power_error(targets, power),
             Loss::SoftmaxCrossEntropy => out.softmax_crossentropy_loss(targets),
         };
 

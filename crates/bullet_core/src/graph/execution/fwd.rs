@@ -1,11 +1,15 @@
 use crate::{
     backend::device::{
         base::BaseOperations,
-        blas::{BlasOperations, GemmConfig, Shape},
+        blas::{BlasOperations, GemmConfig},
         Device, DeviceBuffer, OperationError,
     },
     graph::{
-        ir::{node::AnnotatedNode, op::GraphIROp},
+        ir::{
+            node::AnnotatedNode,
+            op::{GraphIROp, UnaryOp},
+            shape::Shape,
+        },
         Graph,
     },
 };
@@ -13,26 +17,17 @@ use crate::{
 use super::{concat, linear_comb, matmul, setup_ones, setup_softmax, slice, sparse};
 
 impl<D: Device> Graph<D> {
-    pub(crate) fn forward_node(&mut self, output_node: AnnotatedNode) -> Result<(), OperationError<D::DeviceError>> {
+    pub(crate) fn forward_node(&mut self, output_node: usize) -> Result<(), OperationError<D::DeviceError>> {
         use GraphIROp::*;
 
         let get = |node: AnnotatedNode| self.get(node.idx).unwrap();
 
-        let output_tensor = &mut *self.get_mut(output_node.idx)?;
+        let output_tensor = &mut *self.get_mut(output_node)?;
         let op = if let Some(op) = &output_tensor.operation { op } else { return Ok(()) };
         let internal = &mut output_tensor.internal;
         let output = output_tensor.values.dense_mut()?;
-        let outn = output_tensor.own;
 
         match op {
-            Activate(node, act) => {
-                let input = get(*node);
-                let input = input.values.dense()?;
-                assert_eq!(outn.shape, node.shape);
-                output.set_batch_size(input.batch_size())?;
-                output.buf.activate_fwd(input.size(), &input.buf, *act)?;
-                Ok(())
-            }
             Affine(wn, inp, bn) => {
                 let w = get(*wn);
                 let i = get(*inp);
@@ -197,19 +192,49 @@ impl<D: Device> Graph<D> {
             }
             SparseAffineDualActivate(wn, sn, nn, bn, act) => {
                 assert_eq!(sn.shape, nn.shape);
-                sparse::affine_dual(
-                    get(*wn).values.dense()?,
-                    wn.shape,
-                    get(*sn).values.sparse()?,
-                    get(*nn).values.sparse()?,
-                    sn.shape,
-                    get(*bn).values.dense()?,
-                    bn.shape,
-                    output,
-                    *act,
-                )
+
+                if let Some(bn) = bn {
+                    sparse::affine_dual(
+                        get(*wn).values.dense()?,
+                        wn.shape,
+                        get(*sn).values.sparse()?,
+                        get(*nn).values.sparse()?,
+                        sn.shape,
+                        Some((get(*bn).values.dense()?, bn.shape)),
+                        output,
+                        *act,
+                    )
+                } else {
+                    sparse::affine_dual(
+                        get(*wn).values.dense()?,
+                        wn.shape,
+                        get(*sn).values.sparse()?,
+                        get(*nn).values.sparse()?,
+                        sn.shape,
+                        None,
+                        output,
+                        *act,
+                    )
+                }
             }
             ToDense(node) => get(*node).values.sparse()?.copy_into_dense(output),
+            Unary(node, unary) => {
+                let vals = get(*node);
+                let vals = vals.values.dense()?;
+                let size = vals.size();
+
+                assert_eq!(output.single_size(), vals.single_size());
+                output.set_batch_size(vals.batch_size())?;
+
+                match unary {
+                    UnaryOp::DiffableFromOutput(act) => output.buf.diffable_from_output_fwd(size, &vals.buf, *act)?,
+                    UnaryOp::Add(x) => output.buf.add_scalar(size, *x, &vals.buf)?,
+                    UnaryOp::Mul(x) => output.buf.geam(size, *x, Some(&vals.buf), 0.0, None)?,
+                    UnaryOp::AbsPow(x) => output.buf.abs_pow_scalar(size, *x, &vals.buf)?,
+                }
+
+                Ok(())
+            }
             MaskedSoftmaxCrossEntropyLoss(mask, input, target) => {
                 let masks = get(*mask);
                 let inputs = get(*input);

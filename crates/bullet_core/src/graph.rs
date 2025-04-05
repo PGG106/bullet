@@ -11,20 +11,19 @@ use std::{
     time::Instant,
 };
 
-use ir::{node::AnnotatedNode, GraphIRError};
+use ir::{node::AnnotatedNode, shape::Shape, GraphIRError};
 
 use crate::backend::{
-    device::{blas::Shape, Device, OperationError},
-    tensor::Tensor,
+    device::{Device, OperationError},
+    tensor::{read_from_byte_buffer, Tensor},
 };
 
 pub struct Graph<D: Device> {
     nodes: Vec<Option<RefCell<Tensor<D>>>>,
-    root: usize,
     inputs: HashMap<String, usize>,
     weights: HashMap<String, usize>,
     device: Arc<D>,
-    profile: HashMap<Node, ProfileInformation>,
+    profile: HashMap<usize, ProfileInformation>,
 }
 
 #[derive(Debug)]
@@ -68,9 +67,9 @@ struct ProfileInformation {
 }
 
 impl<D: Device> Graph<D> {
-    fn get_node_info(&self, idx: usize) -> Result<AnnotatedNode, OperationError<D::DeviceError>> {
+    fn get_node_info(&self, idx: usize) -> Result<usize, OperationError<D::DeviceError>> {
         if let Ok(node) = self.get(idx) {
-            Ok(node.own)
+            Ok(node.idx)
         } else {
             Err(OperationError::TensorOptimisedOut)
         }
@@ -100,11 +99,15 @@ impl<D: Device> Graph<D> {
         }
     }
 
+    fn root(&self) -> usize {
+        self.nodes.len() - 1
+    }
+
     pub fn forward(&mut self) -> Result<f32, OperationError<D::DeviceError>> {
         for node in 0..self.nodes.len() {
             match self.get_node_info(node) {
                 Ok(node) => {
-                    let t = if self.profile.contains_key(&node.into()) {
+                    let t = if self.profile.contains_key(&node) {
                         self.device().synchronise()?;
                         Some(Instant::now())
                     } else {
@@ -115,7 +118,7 @@ impl<D: Device> Graph<D> {
 
                     if let Some(t) = t {
                         self.device().synchronise()?;
-                        let prof = self.profile.get_mut(&node.into()).unwrap();
+                        let prof = self.profile.get_mut(&node).unwrap();
                         prof.fwd_time += t.elapsed().as_micros();
                         prof.fwd_count += 1;
                     }
@@ -127,16 +130,16 @@ impl<D: Device> Graph<D> {
 
         self.device.synchronise()?;
         self.device.get_last_device_error()?;
-        Ok(self.get(self.root)?.get_scalar().unwrap())
+        Ok(self.get(self.root())?.get_scalar().unwrap())
     }
 
     pub fn backward(&mut self) -> Result<(), OperationError<D::DeviceError>> {
-        self.get_mut(self.root)?.set_grad_to_unit()?;
+        self.get_mut(self.root())?.set_grad_to_unit()?;
 
         for node in (0..self.nodes.len()).rev() {
             match self.get_node_info(node) {
                 Ok(node) => {
-                    let t = if self.profile.contains_key(&node.into()) {
+                    let t = if self.profile.contains_key(&node) {
                         self.device().synchronise()?;
                         Some(Instant::now())
                     } else {
@@ -147,7 +150,7 @@ impl<D: Device> Graph<D> {
 
                     if let Some(t) = t {
                         self.device().synchronise()?;
-                        let prof = self.profile.get_mut(&node.into()).unwrap();
+                        let prof = self.profile.get_mut(&node).unwrap();
                         prof.bwd_time += t.elapsed().as_micros();
                         prof.bwd_count += 1;
                     }
@@ -163,7 +166,7 @@ impl<D: Device> Graph<D> {
     }
 
     pub fn profile_node(&mut self, node: Node, id: &str) {
-        self.profile.insert(node, ProfileInformation { name: id.to_string(), ..Default::default() });
+        self.profile.insert(node.idx, ProfileInformation { name: id.to_string(), ..Default::default() });
     }
 
     pub fn profile_all_nodes(&mut self) {
@@ -171,11 +174,10 @@ impl<D: Device> Graph<D> {
             if let Some(tensor) = &self.nodes[node] {
                 let tensor = tensor.borrow();
                 if let Some(op) = tensor.operation.as_ref() {
-                    let node = tensor.own;
                     let id = format!("{:?}", *op);
                     let id = id.split_once('(').unwrap();
-                    let name = format!("Node {: >2} = {}", node.idx, id.0);
-                    self.profile.insert(node.into(), ProfileInformation { name, ..Default::default() });
+                    let name = format!("Node {: >2} = {}", tensor.idx, id.0);
+                    self.profile.insert(tensor.idx, ProfileInformation { name, ..Default::default() });
                 }
             }
         }
@@ -214,6 +216,47 @@ impl<D: Device> Graph<D> {
         println!("+---------------------------------------------------------------+");
         println!("| {: <40}{fwd: <10} {bwd: <10} |", "Total");
         println!("+---------------------------------------------------------------+");
+    }
+
+    /// Writes the weights of a graph to a file. If `gradients` is true,
+    /// it will instead write the gradients of those weights.
+    pub fn write_to_file(&self, path: &str) {
+        use std::{fs::File, io::Write};
+
+        let weight_ids = self.weight_ids();
+
+        let mut buf = Vec::new();
+
+        for id in &weight_ids {
+            let weights = self.get_weights(id);
+            let this_buf = weights.values.dense().unwrap().write_to_byte_buffer(id).unwrap();
+
+            buf.extend_from_slice(&this_buf);
+        }
+
+        let mut file = File::create(path).unwrap();
+        file.write_all(&buf).unwrap();
+    }
+
+    /// Loads the weights of a graph from a file. If `gradients` is true,
+    /// it will instead load the gradients of those weights.
+    pub fn load_from_file(&mut self, path: &str, old_format: bool) -> Result<(), D::DeviceError> {
+        use std::{fs::File, io::Read};
+
+        let mut buf = Vec::new();
+        let mut file = File::open(path).unwrap();
+        file.read_to_end(&mut buf).unwrap();
+
+        let mut offset = 0;
+
+        while offset < buf.len() {
+            let (buffer, id, bytes_read) = read_from_byte_buffer(&buf[offset..], old_format);
+            self.get_weights_mut(&id).load_dense_from_slice(None, &buffer).expect("This is guaranteed!");
+
+            offset += bytes_read;
+        }
+
+        Ok(())
     }
 
     pub fn zero_grads(&mut self) -> Result<(), D::DeviceError> {

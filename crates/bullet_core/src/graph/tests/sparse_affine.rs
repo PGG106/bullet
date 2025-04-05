@@ -1,9 +1,10 @@
 use crate::{
-    backend::device::{base::Activation, blas::Shape, Device, OperationError},
+    backend::device::{Device, OperationError},
     graph::{
         ir::{
             args::GraphIRCompileArgs,
-            op::{GraphIROp, GraphIROpError, GraphIROpErrorType},
+            op::{DiffableFromOutput, GraphIROp, GraphIROpError, GraphIROpErrorType},
+            shape::Shape,
             GraphIR, GraphIRError,
         },
         GraphError,
@@ -15,8 +16,8 @@ pub fn sparse_affine<D: Device>(device: D) -> Result<(), GraphError<D::DeviceErr
     let w = builder.add_weights("w", Shape::new(1, 3)).unwrap();
     let b = builder.add_weights("b", Shape::new(1, 1)).unwrap();
     let i = builder.add_sparse_input("i", Shape::new(3, 1), 2).unwrap();
-    let out = builder.add_op(GraphIROp::SparseAffineActivate(w, i, Some(b), Activation::Identity), true)?;
-    builder.add_op(GraphIROp::ReduceAcrossBatch(out), true)?;
+    let out = builder.add_op(GraphIROp::SparseAffineActivate(w, i, Some(b), DiffableFromOutput::Identity))?;
+    builder.add_op(GraphIROp::ReduceAcrossBatch(out))?;
     let mut graph = builder.compile(device, GraphIRCompileArgs::default())?;
 
     graph.get_weights_mut("w").load_dense_from_slice(None, &[-1.0, 4.0, 2.0]).unwrap();
@@ -52,9 +53,9 @@ pub fn sparse_affine_batched_biases<D: Device>(device: D) -> Result<(), GraphErr
     let i = builder.add_sparse_input("i", Shape::new(3, 1), 2).unwrap();
     let bb = builder.add_sparse_input("bb", Shape::new(2, 1), 1).unwrap();
 
-    let b = builder.add_op(GraphIROp::SparseAffineActivate(b, bb, None, Activation::Identity), true)?;
-    let out = builder.add_op(GraphIROp::SparseAffineActivate(w, i, Some(b), Activation::Identity), true)?;
-    builder.add_op(GraphIROp::ReduceAcrossBatch(out), true)?;
+    let b = builder.add_op(GraphIROp::SparseAffineActivate(b, bb, None, DiffableFromOutput::Identity))?;
+    let out = builder.add_op(GraphIROp::SparseAffineActivate(w, i, Some(b), DiffableFromOutput::Identity))?;
+    builder.add_op(GraphIROp::ReduceAcrossBatch(out))?;
     let mut graph = builder.compile(device, GraphIRCompileArgs::default())?;
 
     graph.get_weights_mut("w").load_dense_from_slice(None, &[-1.0, 4.0, 2.0]).expect("loading weights");
@@ -91,9 +92,9 @@ pub fn sparse_affine_dual<D: Device>(device: D) -> Result<(), GraphError<D::Devi
     let i1 = builder.add_sparse_input("i1", Shape::new(3, 1), 2).unwrap();
     let i2 = builder.add_sparse_input("i2", Shape::new(3, 1), 2).unwrap();
     let dot = builder.add_dense_input("dot", Shape::new(1, 2)).unwrap();
-    let out = builder.add_op(GraphIROp::SparseAffineDualActivate(w, i1, i2, b, Activation::Identity), true)?;
-    let out2 = builder.add_op(GraphIROp::Matmul(dot, false, out, false), true)?;
-    builder.add_op(GraphIROp::ReduceAcrossBatch(out2), true)?;
+    let out = builder.add_op(GraphIROp::SparseAffineDualActivate(w, i1, i2, Some(b), DiffableFromOutput::Identity))?;
+    let out2 = builder.add_op(GraphIROp::Matmul(dot, false, out, false))?;
+    builder.add_op(GraphIROp::ReduceAcrossBatch(out2))?;
     let mut graph = builder.compile(device, GraphIRCompileArgs::default())?;
 
     graph.get_weights_mut("w").load_dense_from_slice(None, &[-1.0, 4.0, 2.0]).unwrap();
@@ -131,8 +132,8 @@ pub fn sparse_affine_check_not_batched<D: Device>(_device: D) -> Result<(), Grap
     let i1 = builder.add_sparse_input("i1", Shape::new(3, 1), 2).unwrap();
     let i2 = builder.add_sparse_input("i2", Shape::new(3, 1), 2).unwrap();
 
-    let op = GraphIROp::SparseAffineDualActivate(w, i1, i2, b, Activation::Identity);
-    let out = builder.add_op(op, true);
+    let op = GraphIROp::SparseAffineDualActivate(w, i1, i2, Some(b), DiffableFromOutput::Identity);
+    let out = builder.add_op(op);
 
     assert_eq!(out, Err(GraphIRError::Op(GraphIROpError::new(&op, GraphIROpErrorType::BatchedInputNotSupported))));
 

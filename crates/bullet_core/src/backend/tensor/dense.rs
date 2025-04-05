@@ -1,6 +1,6 @@
 use std::{fmt::Debug, num::NonZeroUsize, sync::Arc};
 
-use crate::backend::device::{Device, DeviceBuffer};
+use crate::backend::device::{base::BaseOperations, blas::BlasOperations, Device, DeviceBuffer, OperationError};
 
 pub struct DenseMatrix<D: Device> {
     pub(crate) buf: D::BufferF32,
@@ -24,6 +24,38 @@ impl<D: Device> DenseMatrix<D> {
         let mut res = Self { buf: D::BufferF32::new(device, size)?, single_size: size, batch_size: None };
         res.load_from_slice(None, &vec![1.0; size])?;
         Ok(res)
+    }
+
+    /// Calculates `self += scale * rhs`
+    pub fn add(&mut self, scale: f32, rhs: &Self) -> Result<(), OperationError<D::DeviceError>> {
+        if self.size() != rhs.size() {
+            return Err(OperationError::IndexOutOfBounds);
+        }
+
+        self.buf.geam(self.size(), 1.0, None, scale, Some(&rhs.buf))?;
+
+        Ok(())
+    }
+
+    /// Calculates `self = (1 - lambda) * self + lambda * rhs`
+    pub fn lerp(&mut self, lambda: f32, rhs: &Self) -> Result<(), OperationError<D::DeviceError>> {
+        if self.size() != rhs.size() {
+            return Err(OperationError::IndexOutOfBounds);
+        }
+
+        self.buf.geam(self.size(), 1.0 - lambda, None, lambda, Some(&rhs.buf))?;
+
+        Ok(())
+    }
+
+    pub fn clamp(&mut self, min: f32, max: f32) -> Result<(), OperationError<D::DeviceError>> {
+        self.buf.clip(self.size(), min, max)?;
+        Ok(())
+    }
+
+    pub fn scale(&mut self, scale: f32) -> Result<(), OperationError<D::DeviceError>> {
+        self.buf.geam(self.size(), scale, None, 0.0, None)?;
+        Ok(())
     }
 
     pub fn allocated_size(&self) -> usize {
@@ -114,4 +146,49 @@ impl<D: Device> DenseMatrix<D> {
 
         Ok(buf)
     }
+}
+
+/// Reads a matrix from a byte buffer, returning how many bytes were read
+/// and the matrix ID that was read.
+pub fn read_from_byte_buffer(bytes: &[u8], old_format: bool) -> (Vec<f32>, String, usize) {
+    const USIZE: usize = std::mem::size_of::<usize>();
+
+    let mut offset = 0;
+
+    let mut id = String::new();
+    loop {
+        let ch = bytes[offset];
+        offset += 1;
+
+        if ch == b'\n' {
+            break;
+        }
+
+        id.push(char::from(ch));
+    }
+
+    let mut single_size = [0u8; USIZE];
+    single_size.copy_from_slice(&bytes[offset..offset + USIZE]);
+    offset += USIZE;
+
+    let mut single_size = usize::from_le_bytes(single_size);
+
+    if old_format {
+        let mut cols = [0u8; USIZE];
+        cols.copy_from_slice(&bytes[offset..offset + USIZE]);
+        offset += USIZE;
+        single_size *= usize::from_le_bytes(cols);
+    }
+
+    let total_read = offset + single_size * 4;
+
+    let mut values = vec![0.0; single_size];
+
+    for (word, val) in bytes[offset..total_read].chunks_exact(4).zip(values.iter_mut()) {
+        let mut buf = [0; 4];
+        buf.copy_from_slice(word);
+        *val = f32::from_le_bytes(buf);
+    }
+
+    (values, id, total_read)
 }

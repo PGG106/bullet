@@ -1,4 +1,3 @@
-pub mod default;
 pub mod logger;
 mod preparer;
 pub mod save;
@@ -11,6 +10,7 @@ use save::SavedFormat;
 use schedule::{lr::LrScheduler, wdl::WdlScheduler, TrainingSchedule};
 use settings::LocalSettings;
 
+pub use crate::default;
 use crate::ExecutionContext;
 
 use std::{
@@ -258,12 +258,11 @@ pub trait NetworkTrainer {
 
     fn save_weights_portion(&self, path: &str, weights: &[SavedFormat]) -> io::Result<()> {
         let mut file = File::create(path).unwrap();
-
         let mut buf = Vec::new();
+        let graph = &self.optimiser().graph;
 
         for fmt in weights {
-            let weights = self.optimiser().graph.get_weights(&fmt.id);
-            buf.extend_from_slice(&fmt.write_to_byte_buffer(weights.values.dense().unwrap())?);
+            buf.extend_from_slice(&fmt.write_to_byte_buffer(graph)?);
         }
 
         file.write_all(&buf)?;

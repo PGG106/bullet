@@ -2,7 +2,6 @@
 Code to relabel a bulletformat dataset with a network
 */
 
-use bullet_core::optimiser::utils::load_graph_weights_from_file;
 use bullet_lib::{
     nn::{Activation, ExecutionContext, Graph, NetworkBuilder, Node, Shape},
     trainer::default::{
@@ -54,7 +53,7 @@ fn main() {
 
     std::thread::spawn(move || {
         let (mut graph, output_node) = build_network(inputs.num_inputs(), inputs.max_active(), hl_size);
-        load_graph_weights_from_file::<ExecutionContext>(&mut graph, NETWORK_PATH, true).unwrap();
+        graph.load_from_file(NETWORK_PATH, true).unwrap();
 
         let mut error = 0.0;
         let mut batches = 0;
@@ -112,8 +111,8 @@ fn build_network(num_inputs: usize, nnz: usize, hl: usize) -> (Graph, Node) {
     let mut out = l0.forward_sparse_dual_with_activation(stm, nstm, Activation::SCReLU);
     out = l1.forward(out);
 
-    let pred = out.activate(Activation::Sigmoid);
-    pred.mse(targets);
+    let pred = out.sigmoid();
+    pred.squared_error(targets);
 
     // graph, output node
     let output_node = out.node();

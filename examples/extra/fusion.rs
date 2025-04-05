@@ -1,26 +1,33 @@
-use bullet_core::backend::cpu::CpuThread;
-use bullet_lib::{
-    nn::{GraphCompileArgs, InitSettings, NetworkBuilder, Shape},
-    Activation,
+use bullet_core::{
+    backend::cpu::{CpuError, CpuThread},
+    graph::{
+        builder::{GraphBuilder, Shape},
+        ir::args::GraphIRCompileArgs,
+    },
 };
 
-fn main() {
-    let mut builder = NetworkBuilder::default();
+fn main() -> Result<(), CpuError> {
+    let mut builder = GraphBuilder::default();
 
+    // inputs
     let stm = builder.new_sparse_input("stm", Shape::new(768, 1), 32);
-    let ntm = builder.new_sparse_input("ntm", Shape::new(768, 1), 32);
-    let weights = builder.new_weights("weights", Shape::new(1, 768), InitSettings::Zeroed);
-    let bias = builder.new_weights("bias", Shape::new(1, 1), InitSettings::Zeroed);
-    let stm = (weights.matmul(stm) + bias).activate(Activation::SCReLU);
-    let ntm = (weights.matmul(ntm) + bias).activate(Activation::SCReLU);
-    let out = stm.concat(ntm);
-    let outw = builder.new_weights("outw", Shape::new(1, 2), InitSettings::Zeroed);
-    let _ = outw.matmul(out);
+    let nstm = builder.new_sparse_input("nstm", Shape::new(768, 1), 32);
+    let targets = builder.new_dense_input("targets", Shape::new(1, 1));
 
-    let args = GraphCompileArgs::default().emit_ir();
+    // trainable weights
+    let l0 = builder.new_affine("l0", 768, 512);
+    let l1 = builder.new_affine("l1", 256, 1);
 
-    builder.set_compile_args(args);
+    // inference
+    let stm_subnet = l0.forward(stm).crelu().pairwise_mul().pairwise_mul();
+    let ntm_subnet = l0.forward(nstm).crelu().pairwise_mul().pairwise_mul();
+    let out = l1.forward(stm_subnet.concat(ntm_subnet));
+    let pred = out.sigmoid();
+    pred.squared_error(targets);
+
+    // build graph
+    builder.set_compile_args(GraphIRCompileArgs::default().fancy_ir_display(1.0));
     let graph = builder.build(CpuThread);
 
-    println!("{:?}", graph.get_last_device_error());
+    graph.get_last_device_error()
 }

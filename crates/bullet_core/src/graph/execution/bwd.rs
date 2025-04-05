@@ -1,11 +1,15 @@
 use crate::{
     backend::device::{
         base::BaseOperations,
-        blas::{BlasOperations, GemmConfig, Shape},
+        blas::{BlasOperations, GemmConfig},
         Device, DeviceBuffer, OperationError,
     },
     graph::{
-        ir::{node::AnnotatedNode, op::GraphIROp},
+        ir::{
+            node::AnnotatedNode,
+            op::{GraphIROp, UnaryOp},
+            shape::Shape,
+        },
         Graph,
     },
 };
@@ -13,15 +17,15 @@ use crate::{
 use super::{concat, linear_comb, matmul, setup_ones, slice, sparse};
 
 impl<D: Device> Graph<D> {
-    pub(crate) fn backward_node(&mut self, output_node: AnnotatedNode) -> Result<(), OperationError<D::DeviceError>> {
+    pub(crate) fn backward_node(&mut self, output_node: usize) -> Result<(), OperationError<D::DeviceError>> {
         use GraphIROp::*;
 
         let get = |node: AnnotatedNode| self.get_mut(node.idx).unwrap();
 
-        let output_tensor = &mut *self.get_mut(output_node.idx)?;
+        let output_tensor = &mut *self.get_mut(output_node)?;
         let op = if let Some(op) = &output_tensor.operation { op } else { return Ok(()) };
         let internal = &mut output_tensor.internal;
-        let outn = output_tensor.own;
+        let output_size = output_tensor.values.single_size();
         let output_grad = if let Some(grad) = output_tensor.gradients.as_ref() {
             grad
         } else {
@@ -29,17 +33,6 @@ impl<D: Device> Graph<D> {
         };
 
         match op {
-            Activate(node, act) => {
-                let input = &mut *get(*node);
-                if let Some(grad) = input.gradients.as_mut() {
-                    let input = input.values.dense()?;
-                    assert_eq!(outn.shape, node.shape);
-                    assert_eq!(output_grad.size(), input.size());
-                    assert_eq!(output_grad.batch_size(), input.batch_size());
-                    grad.set_batch_size(output_grad.batch_size())?;
-                    grad.buf.activate_bwd(input.size(), &input.buf, &output_grad.buf, *act)?;
-                }
-            }
             Affine(wn, inp, bn) => {
                 let i = &mut *get(*inp);
                 let w = &mut *get(*wn);
@@ -302,26 +295,61 @@ impl<D: Device> Graph<D> {
             }
             SparseAffineDualActivate(wn, sn, nn, bn, act) => {
                 let w = &mut *get(*wn);
-                let b = &mut *get(*bn);
                 let s = get(*sn);
 
-                let bs = s.values.batch_size().unwrap_or(1);
-                assert_eq!(sn.shape, nn.shape);
-                setup_ones(w.values.dense()?.buf.device(), internal, bs)?;
-                let ones = &internal.get("ones").unwrap().borrow().buf;
-                sparse::backprop_affine_dual(
-                    w,
-                    wn.shape,
-                    s.values.sparse()?,
-                    get(*nn).values.sparse()?,
-                    sn.shape,
-                    &mut Some((b, ones)),
-                    output_tensor.values.dense()?,
-                    output_grad,
-                    *act,
-                )?;
+                if let Some(bn) = bn {
+                    let bs = s.values.batch_size().unwrap_or(1);
+                    setup_ones(w.values.dense()?.buf.device(), internal, bs)?;
+                    let ones = &internal.get("ones").unwrap().borrow().buf;
+
+                    sparse::backprop_affine_dual(
+                        w,
+                        wn.shape,
+                        s.values.sparse()?,
+                        get(*nn).values.sparse()?,
+                        sn.shape,
+                        &mut Some((&mut *get(*bn), ones)),
+                        output_tensor.values.dense()?,
+                        output_grad,
+                        *act,
+                    )?;
+                } else {
+                    sparse::backprop_affine_dual(
+                        w,
+                        wn.shape,
+                        s.values.sparse()?,
+                        get(*nn).values.sparse()?,
+                        sn.shape,
+                        &mut None,
+                        output_tensor.values.dense()?,
+                        output_grad,
+                        *act,
+                    )?;
+                }
             }
             ToDense(_) => return Err(OperationError::UnsupportedOperation),
+            Unary(node, unary) => {
+                let vals = &mut *get(*node);
+
+                if let Some(grd) = vals.gradients.as_mut() {
+                    let input = vals.values.dense()?;
+                    let size = output_grad.size();
+                    let out_grd = &output_grad.buf;
+                    assert_eq!(output_size, node.shape.size());
+                    assert_eq!(size, input.size());
+                    assert_eq!(output_grad.batch_size(), input.batch_size());
+                    grd.set_batch_size(output_grad.batch_size())?;
+
+                    match unary {
+                        UnaryOp::DiffableFromOutput(act) => {
+                            grd.buf.diffable_from_output_bwd(size, &input.buf, out_grd, *act)?
+                        }
+                        UnaryOp::Add(_) => grd.buf.geam(size, 1.0, None, 1.0, Some(out_grd))?,
+                        UnaryOp::Mul(x) => grd.buf.geam(size, 1.0, None, *x, Some(out_grd))?,
+                        UnaryOp::AbsPow(x) => grd.buf.abs_pow_scalar_backward(size, *x, &input.buf, out_grd)?,
+                    }
+                }
+            }
             MaskedSoftmaxCrossEntropyLoss(mask, input, target) => {
                 let masks = &*get(*mask);
                 let masks = masks.values.sparse()?;
