@@ -1,1 +1,1 @@
-cargo r -r --example alexnet
+cargo r -r --example alexnet-morelayers
