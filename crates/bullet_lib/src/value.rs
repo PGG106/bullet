@@ -1,8 +1,8 @@
-mod builder;
+pub(crate) mod builder;
 
 use crate::default::Trainer;
 
-pub use builder::ValueTrainerBuilder;
+pub use builder::{NoOutputBuckets, ValueTrainerBuilder};
 
 pub use crate::default::loader;
 

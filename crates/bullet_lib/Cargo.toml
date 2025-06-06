@@ -24,7 +24,7 @@ bullet_core = { workspace = true }
 bulletformat = { workspace = true }
 montyformat = { workspace = true }
 sfbinpack = "0.4.1"
-viriformat = "1.0.0"
+viriformat = "1.2.0"
 
 [[example]]
 name = "advanced"
@@ -59,13 +59,21 @@ name = "ataxx"
 path = "../../examples/extra/ataxx.rs"
 
 [[example]]
-name = "relabel"
-path = "../../examples/extra/relabel.rs"
-
-[[example]]
-name = "attention"
-path = "../../examples/extra/attention.rs"
-
-[[example]]
 name = "policy"
 path = "../../examples/extra/policy.rs"
+
+[[example]]
+name = "1_simple"
+path = "../../examples/progression/1_simple.rs"
+
+[[example]]
+name = "2_output_buckets"
+path = "../../examples/progression/2_output_buckets.rs"
+
+[[example]]
+name = "3_input_buckets"
+path = "../../examples/progression/3_input_buckets.rs"
+
+[[example]]
+name = "4_multi_layer"
+path = "../../examples/progression/4_multi_layer.rs"

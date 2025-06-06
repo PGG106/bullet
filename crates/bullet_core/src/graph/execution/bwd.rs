@@ -7,7 +7,7 @@ use crate::{
     graph::{
         ir::{
             node::AnnotatedNode,
-            op::{GraphIROp, UnaryOp},
+            op::{GraphIROp, Reduce, UnaryOp},
             shape::Shape,
         },
         Graph,
@@ -203,7 +203,7 @@ impl<D: Device> Graph<D> {
                     )?;
                 }
             }
-            ReduceAcrossBatch(input) => {
+            ReduceAcrossBatch(input, reduction) => {
                 let input = &mut *get(*input);
                 if let Some(grd) = input.gradients.as_mut() {
                     let vals = input.values.dense()?;
@@ -218,11 +218,19 @@ impl<D: Device> Graph<D> {
                     assert_eq!(vals.single_size(), grd.single_size());
 
                     grd.set_batch_size(bs)?;
+
+                    let bs = bs.unwrap_or(1);
+
+                    let alpha = match *reduction {
+                        Reduce::Avg => 1.0 / bs as f32,
+                        Reduce::Sum => 1.0,
+                    };
+
                     linear_comb::add_assign_single_to_batched_scaled::<D>(
                         ss,
-                        bs.unwrap_or(1),
+                        bs,
                         ones,
-                        1.0,
+                        alpha,
                         &output_grad.buf,
                         &mut grd.buf,
                     )?;
@@ -277,12 +285,23 @@ impl<D: Device> Graph<D> {
                     )?;
                 }
             }
-            SparseAffineActivate(wn, inp, bn, act) => {
+            SparseAffineActivate(wn, inp, vals, bn, act) => {
                 let i = &mut *get(*inp);
                 let w = &mut *get(*wn);
                 let o = output_tensor.values.dense()?;
 
                 let i = i.values.sparse()?;
+
+                let v = vals.map(get);
+                let v = if let Some(v) = v.as_ref() {
+                    if v.gradients.is_some() {
+                        return Err(OperationError::UnsupportedOperation);
+                    }
+
+                    Some(v.values.dense()?)
+                } else {
+                    None
+                };
 
                 if let Some(b) = bn {
                     let bs = i.batch_size().unwrap_or(1);
@@ -294,13 +313,25 @@ impl<D: Device> Graph<D> {
                         w,
                         wn.shape,
                         i,
+                        v,
                         inp.shape,
                         &mut Some((&mut *get(*b), ones)),
                         o,
                         output_grad,
                     )?;
                 } else {
-                    sparse::backprop_affine_activate(None, *act, w, wn.shape, i, inp.shape, &mut None, o, output_grad)?;
+                    sparse::backprop_affine_activate(
+                        None,
+                        *act,
+                        w,
+                        wn.shape,
+                        i,
+                        v,
+                        inp.shape,
+                        &mut None,
+                        o,
+                        output_grad,
+                    )?;
                 }
             }
             SparseAffineDualActivate(wn, sn, nn, bn, act) => {
@@ -346,8 +377,8 @@ impl<D: Device> Graph<D> {
                     let size = output_grad.size();
                     let out_grd = &output_grad.buf;
                     assert_eq!(output_size, node.shape.size());
-                    assert_eq!(size, input.size());
                     assert_eq!(output_grad.batch_size(), input.batch_size());
+                    assert_eq!(size, input.size());
                     grd.set_batch_size(output_grad.batch_size())?;
 
                     match unary {

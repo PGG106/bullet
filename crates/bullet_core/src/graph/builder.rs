@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    ops::{Add, Div, Mul, Sub},
+    ops::{Add, Div, Mul, Neg, Sub},
     sync::{Mutex, MutexGuard},
 };
 
@@ -10,7 +10,7 @@ use super::{
     ir::{
         args::GraphIRCompileArgs,
         node::AnnotatedNode,
-        op::{DiffableFromOutput, GraphIROp, UnaryOp},
+        op::{DiffableFromOutput, GraphIROp, Reduce, UnaryOp},
         GraphIR,
     },
     Graph, Node,
@@ -105,7 +105,12 @@ impl GraphBuilder {
 
     pub fn build<D: Device>(self, device: D) -> Graph<D> {
         let mut builder = self.graph_builder.into_inner().unwrap();
-        builder.add_op(GraphIROp::ReduceAcrossBatch(builder.root().unwrap())).unwrap();
+        let root = builder.root().unwrap();
+
+        if builder.get(root.idx).unwrap().batched {
+            builder.add_op(GraphIROp::ReduceAcrossBatch(root, Reduce::Sum)).unwrap();
+        }
+
         let mut graph = builder.compile(device, self.args).unwrap();
 
         for (id, init_data) in self.init_data.lock().unwrap().iter() {
@@ -166,6 +171,14 @@ impl Add<f32> for GraphBuilderNode<'_> {
     }
 }
 
+impl Neg for GraphBuilderNode<'_> {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        -1.0 * self
+    }
+}
+
 impl<'a> Sub<GraphBuilderNode<'a>> for f32 {
     type Output = GraphBuilderNode<'a>;
 
@@ -187,6 +200,14 @@ impl<'a> Mul<GraphBuilderNode<'a>> for f32 {
 
     fn mul(self, rhs: GraphBuilderNode<'a>) -> Self::Output {
         rhs.builder.apply(GraphIROp::Unary(rhs.node, UnaryOp::Mul(self)))
+    }
+}
+
+impl<'a> Mul<GraphBuilderNode<'a>> for GraphBuilderNode<'a> {
+    type Output = GraphBuilderNode<'a>;
+
+    fn mul(self, rhs: GraphBuilderNode<'a>) -> Self::Output {
+        self.concat(rhs).pairwise_mul()
     }
 }
 
@@ -264,17 +285,31 @@ impl GraphBuilderNode<'_> {
         self.builder.apply(GraphIROp::Copy(self.node, true))
     }
 
+    pub fn copy(self) -> Self {
+        self.builder.apply(GraphIROp::Copy(self.node, false))
+    }
+
     pub fn linear_comb(self, alpha: f32, rhs: Self, beta: f32) -> Self {
         self.builder.apply(GraphIROp::LinearCombination(alpha, self.node, beta, rhs.node))
     }
 
     pub fn reduce_sum_across_batch(self) -> Self {
-        self.builder.apply(GraphIROp::ReduceAcrossBatch(self.node))
+        self.builder.apply(GraphIROp::ReduceAcrossBatch(self.node, Reduce::Sum))
+    }
+
+    pub fn reduce_avg_across_batch(self) -> Self {
+        self.builder.apply(GraphIROp::ReduceAcrossBatch(self.node, Reduce::Avg))
     }
 
     pub fn matmul(self, rhs: Self) -> Self {
         if self.builder.builder().get(rhs.node.idx).unwrap().sparse.is_some() {
-            self.builder.apply(GraphIROp::SparseAffineActivate(self.node, rhs.node, None, DiffableFromOutput::Identity))
+            self.builder.apply(GraphIROp::SparseAffineActivate(
+                self.node,
+                rhs.node,
+                None,
+                None,
+                DiffableFromOutput::Identity,
+            ))
         } else {
             self.builder.apply(GraphIROp::Matmul(self.node, false, rhs.node, false))
         }
@@ -295,6 +330,14 @@ impl GraphBuilderNode<'_> {
     #[deprecated]
     pub fn mpe(self, targets: Self, power: f32) -> Self {
         self.power_error(targets, power)
+    }
+
+    pub fn repeat(self, n: usize) -> Self {
+        let shape = self.node.shape;
+        let ones = self.builder.new_constant(Shape::new(1, n), &vec![1.0; n]);
+        let resh = self.reshape(Shape::new(shape.size(), 1));
+        let reps = resh.matmul(ones);
+        reps.reshape(Shape::new(shape.rows(), shape.cols() * n))
     }
 
     #[deprecated]
@@ -366,5 +409,19 @@ impl<'a> Affine<'a> {
         activation: Activation,
     ) -> GraphBuilderNode<'a> {
         self.forward(stm).concat(self.forward(ntm)).activate(activation)
+    }
+
+    pub fn forward_sparse_with_values(
+        self,
+        stm: GraphBuilderNode<'a>,
+        vals: GraphBuilderNode<'a>,
+    ) -> GraphBuilderNode<'a> {
+        stm.builder.apply(GraphIROp::SparseAffineActivate(
+            self.weights.node,
+            stm.node,
+            Some(vals.node),
+            Some(self.bias.node),
+            DiffableFromOutput::Identity,
+        ))
     }
 }

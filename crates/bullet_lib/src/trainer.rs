@@ -57,7 +57,13 @@ pub trait NetworkTrainer {
     fn optimiser_mut(&mut self) -> &mut Optimiser<ExecutionContext, Self::OptimiserState>;
 
     fn load_from_checkpoint(&mut self, path: &str) {
-        self.optimiser_mut().load_from_checkpoint(&format!("{path}/optimiser_state")).unwrap();
+        let err = self.optimiser_mut().load_from_checkpoint(&format!("{path}/optimiser_state"));
+        if let Err(e) = err {
+            println!();
+            println!("Error loading from checkpoint:");
+            println!("{e:?}");
+            std::process::exit(1);
+        }
     }
 
     fn save_to_checkpoint(&self, path: &str) {
@@ -194,8 +200,9 @@ pub trait NetworkTrainer {
 
             curr_batch += 1;
 
-            if curr_batch % 32 == 0 {
-                prev32_loss /= 32.0;
+            if curr_batch % 32 == 0 || (steps.batches_per_superbatch < 32 && curr_batch == steps.batches_per_superbatch)
+            {
+                prev32_loss /= 32.0_f32.min(steps.batches_per_superbatch as f32);
 
                 error_record.push((superbatch, curr_batch, prev32_loss));
 

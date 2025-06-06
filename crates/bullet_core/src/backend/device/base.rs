@@ -7,12 +7,8 @@ pub struct AdamConfig {
     pub gradient_factor: f32,
     pub learning_rate: f32,
     pub denom: bool,
-}
-
-impl AdamConfig {
-    pub fn new(beta1: f32, beta2: f32, gradient_factor: f32, learning_rate: f32, denom: bool) -> Self {
-        Self { beta1, beta2, gradient_factor, learning_rate, denom }
-    }
+    pub decay: f32,
+    pub clip: Option<(f32, f32)>,
 }
 
 pub trait BaseOperations {
@@ -58,22 +54,9 @@ pub trait BaseOperations {
         grd: &Self,
     ) -> Result<(), Self::BaseError>;
 
-    fn pairwise_fwd(
-        &mut self,
-        size: usize,
-        batch_size: usize,
-        a: &Self,
-        //post_concat: bool,
-    ) -> Result<(), Self::BaseError>;
+    fn pairwise_fwd(&mut self, size: usize, batch_size: usize, a: &Self) -> Result<(), Self::BaseError>;
 
-    fn pairwise_bwd(
-        &mut self,
-        size: usize,
-        batch_size: usize,
-        a: &Self,
-        grd: &Self,
-        //post_concat: bool,
-    ) -> Result<(), Self::BaseError>;
+    fn pairwise_bwd(&mut self, size: usize, batch_size: usize, a: &Self, grd: &Self) -> Result<(), Self::BaseError>;
 
     fn power_error_fwd(&mut self, power: f32, size: usize, a: &Self, b: &Self) -> Result<(), Self::BaseError>;
 

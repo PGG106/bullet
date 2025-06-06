@@ -3,8 +3,9 @@ mod montybinpack;
 mod rng;
 mod sfbinpack;
 mod text;
-mod viribinpack;
+pub mod viribinpack;
 
+use bullet_core::backend::device::OperationError;
 use bulletformat::BulletFormat;
 pub use direct::{CanBeDirectlySequentiallyLoaded, DirectSequentialDataLoader};
 pub use montybinpack::MontyBinpackLoader;
@@ -14,8 +15,11 @@ pub use viribinpack::ViriBinpackLoader;
 
 use crate::{
     game::{inputs::SparseInputType, outputs::OutputBuckets},
+    nn::{DeviceError, Graph},
     trainer::DataPreparer,
 };
+
+use super::Wgt;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,18 +58,33 @@ pub trait DataLoader<T>: Clone + Send + Sync + 'static {
     fn map_batches<F: FnMut(&[T]) -> bool>(&self, start_batch: usize, batch_size: usize, f: F);
 }
 
+pub(crate) type B<I> = fn(&<I as SparseInputType>::RequiredDataType, f32) -> f32;
+
 #[derive(Clone)]
-pub struct DefaultDataLoader<I, O, D> {
+pub struct DefaultDataLoader<I: SparseInputType, O, D> {
     input_getter: I,
     output_getter: O,
+    blend_getter: B<I>,
+    weight_getter: Option<Wgt<I>>,
+    use_win_rate_model: bool,
     wdl: bool,
     scale: f32,
     loader: D,
 }
 
-impl<I, O, D> DefaultDataLoader<I, O, D> {
-    pub fn new(input_getter: I, output_getter: O, wdl: bool, scale: f32, loader: D) -> Self {
-        Self { input_getter, output_getter, wdl, scale, loader }
+impl<I: SparseInputType, O, D> DefaultDataLoader<I, O, D> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        input_getter: I,
+        output_getter: O,
+        blend_getter: B<I>,
+        weight_getter: Option<Wgt<I>>,
+        use_win_rate_model: bool,
+        wdl: bool,
+        scale: f32,
+        loader: D,
+    ) -> Self {
+        Self { input_getter, output_getter, blend_getter, weight_getter, use_win_rate_model, wdl, scale, loader }
     }
 }
 
@@ -95,6 +114,9 @@ where
         DefaultDataPreparer::prepare(
             self.input_getter.clone(),
             self.output_getter,
+            self.blend_getter,
+            self.weight_getter,
+            self.use_win_rate_model,
             self.wdl,
             data,
             threads,
@@ -115,30 +137,36 @@ pub(crate) struct SparseInput {
 }
 
 /// A batch of data, in the correct format for the GPU.
-pub struct DefaultDataPreparer<I, O> {
-    pub(crate) input_getter: I,
-    pub(crate) output_getter: O,
-    pub(crate) batch_size: usize,
-    pub(crate) stm: SparseInput,
-    pub(crate) nstm: SparseInput,
-    pub(crate) buckets: SparseInput,
-    pub(crate) targets: DenseInput,
+pub struct DefaultDataPreparer<I: SparseInputType, O> {
+    input_getter: I,
+    output_getter: O,
+    batch_size: usize,
+    stm: SparseInput,
+    nstm: SparseInput,
+    buckets: SparseInput,
+    targets: DenseInput,
+    weights: DenseInput,
 }
 
-impl<I: SparseInputType, O: OutputBuckets<I::RequiredDataType>> DefaultDataPreparer<I, O> {
+impl<I, O> DefaultDataPreparer<I, O>
+where
+    I: SparseInputType,
+    O: OutputBuckets<I::RequiredDataType>,
+    I::RequiredDataType: LoadableDataType,
+{
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         input_getter: I,
         output_getter: O,
+        blend_getter: B<I>,
+        weight_getter: Option<Wgt<I>>,
+        use_win_rate_model: bool,
         wdl: bool,
         data: &[I::RequiredDataType],
         threads: usize,
         blend: f32,
         scale: f32,
-    ) -> Self
-    where
-        I::RequiredDataType: LoadableDataType,
-    {
+    ) -> Self {
         let rscale = 1.0 / scale;
         let batch_size = data.len();
         let max_active = input_getter.max_active();
@@ -155,6 +183,7 @@ impl<I: SparseInputType, O: OutputBuckets<I::RequiredDataType>> DefaultDataPrepa
             nstm: SparseInput { max_active, value: vec![0; sparse_size] },
             buckets: SparseInput { max_active: 1, value: vec![0; batch_size] },
             targets: DenseInput { value: vec![0.0; output_size * batch_size] },
+            weights: DenseInput { value: vec![0.0; output_size * batch_size] },
         };
 
         let sparse_chunk_size = max_active * chunk_size;
@@ -165,50 +194,127 @@ impl<I: SparseInputType, O: OutputBuckets<I::RequiredDataType>> DefaultDataPrepa
                 .zip(prep.nstm.value.chunks_mut(sparse_chunk_size))
                 .zip(prep.buckets.value.chunks_mut(chunk_size))
                 .zip(prep.targets.value.chunks_mut(output_size * chunk_size))
-                .for_each(|((((data_chunk, stm_chunk), nstm_chunk), buckets_chunk), results_chunk)| {
-                    let inp = &prep.input_getter;
-                    let out = &prep.output_getter;
-                    s.spawn(move || {
-                        let chunk_len = data_chunk.len();
+                .zip(prep.weights.value.chunks_mut(output_size * chunk_size))
+                .for_each(
+                    |(((((data_chunk, stm_chunk), nstm_chunk), buckets_chunk), results_chunk), weights_chunk)| {
+                        let inp = &prep.input_getter;
+                        let out = &prep.output_getter;
+                        s.spawn(move || {
+                            let chunk_len = data_chunk.len();
 
-                        for i in 0..chunk_len {
-                            let pos = &data_chunk[i];
-                            let mut j = 0;
-                            let sparse_offset = max_active * i;
+                            for i in 0..chunk_len {
+                                let pos = &data_chunk[i];
+                                let mut j = 0;
+                                let sparse_offset = max_active * i;
 
-                            inp.map_features(pos, |our, opp| {
-                                assert!(
-                                    our < input_size && opp < input_size,
-                                    "Input feature index exceeded input size!"
-                                );
+                                inp.map_features(pos, |our, opp| {
+                                    assert!(
+                                        our < input_size && opp < input_size,
+                                        "Input feature index exceeded input size!"
+                                    );
 
-                                stm_chunk[sparse_offset + j] = our as i32;
-                                nstm_chunk[sparse_offset + j] = opp as i32;
+                                    stm_chunk[sparse_offset + j] = our as i32;
+                                    nstm_chunk[sparse_offset + j] = opp as i32;
 
-                                j += 1;
-                            });
+                                    j += 1;
+                                });
 
-                            for j in j..max_active {
-                                stm_chunk[sparse_offset + j] = -1;
-                                nstm_chunk[sparse_offset + j] = -1;
+                                for j in j..max_active {
+                                    stm_chunk[sparse_offset + j] = -1;
+                                    nstm_chunk[sparse_offset + j] = -1;
+                                }
+
+                                assert!(j <= max_active, "More inputs provided than the specified maximum!");
+
+                                buckets_chunk[i] = i32::from(out.bucket(pos));
+                                weights_chunk[i] = weight_getter.map_or(1.0, |w| w(pos));
+
+                                if wdl {
+                                    results_chunk[output_size * i + usize::from(pos.result() as u8)] = 1.0;
+                                } else {
+                                    let score = f32::from(pos.score());
+                                    let score = if use_win_rate_model {
+                                        let p = (score - 270.0) / 380.0;
+                                        let pm = (-score - 270.0) / 380.0;
+                                        0.5 * (1.0 + sigmoid(p) - sigmoid(pm))
+                                    } else {
+                                        sigmoid(rscale * score)
+                                    };
+                                    let result = f32::from(pos.result() as u8) / 2.0;
+                                    let blend = blend_getter(pos, blend);
+                                    assert!((0.0..=1.0).contains(&blend), "WDL proportion must be in [0, 1]");
+                                    results_chunk[i] = blend * result + (1. - blend) * score;
+                                }
                             }
-
-                            assert!(j <= max_active, "More inputs provided than the specified maximum!");
-
-                            buckets_chunk[i] = i32::from(out.bucket(pos));
-
-                            if wdl {
-                                results_chunk[output_size * i + usize::from(pos.result() as u8)] = 1.0;
-                            } else {
-                                let score = 1. / (1. + (-rscale * f32::from(pos.score())).exp());
-                                let result = f32::from(pos.result() as u8) / 2.0;
-                                results_chunk[i] = blend * result + (1. - blend) * score;
-                            }
-                        }
-                    });
-                });
+                        });
+                    },
+                );
         });
 
         prep
     }
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1. / (1. + (-x).exp())
+}
+
+/// # Safety
+///
+/// The graph needs to take sparse `stm` and optionally `nstm` inputs
+/// in the correct format
+pub unsafe fn load_into_graph<Inp, Out>(
+    graph: &mut Graph,
+    prepared: &DefaultDataPreparer<Inp, Out>,
+) -> Result<usize, OperationError<DeviceError>>
+where
+    Inp: SparseInputType,
+    Out: OutputBuckets<Inp::RequiredDataType>,
+{
+    let batch_size = prepared.batch_size;
+    let expected_inputs = prepared.input_getter.num_inputs();
+
+    let input_ids = graph.input_ids();
+
+    if input_ids.contains(&"stm".to_string()) {
+        let input = &prepared.stm;
+        let stm = &mut *graph.get_input_mut("stm");
+
+        if stm.values.single_size() != expected_inputs {
+            return Err(OperationError::InvalidTensorFormat);
+        }
+
+        stm.load_sparse_from_slice(input.max_active, Some(batch_size), &input.value)?;
+    }
+
+    if input_ids.contains(&"nstm".to_string()) {
+        let input = &prepared.nstm;
+        let ntm = &mut *graph.get_input_mut("nstm");
+
+        if ntm.values.single_size() != expected_inputs {
+            return Err(OperationError::InvalidTensorFormat);
+        }
+
+        ntm.load_sparse_from_slice(input.max_active, Some(batch_size), &input.value)?;
+    }
+
+    if input_ids.contains(&"buckets".to_string()) {
+        let input = &prepared.buckets;
+        let buckets = &mut *graph.get_input_mut("buckets");
+
+        if buckets.values.single_size() != Out::BUCKETS {
+            return Err(OperationError::InvalidTensorFormat);
+        }
+
+        buckets.load_sparse_from_slice(input.max_active, Some(batch_size), &input.value)?;
+    }
+
+    if input_ids.contains(&"entry_weights".to_string()) {
+        let weights = &mut *graph.get_input_mut("entry_weights");
+        weights.load_dense_from_slice(Some(batch_size), &prepared.weights.value)?;
+    }
+
+    graph.get_input_mut("targets").load_dense_from_slice(Some(batch_size), &prepared.targets.value)?;
+
+    Ok(batch_size)
 }

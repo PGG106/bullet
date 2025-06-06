@@ -26,8 +26,10 @@ pub type SparseMatrix = tensor::SparseMatrix<ExecutionContext>;
 pub type Matrix = tensor::Matrix<ExecutionContext>;
 pub type Tensor = tensor::Tensor<ExecutionContext>;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum DeviceError {
+    #[default]
+    Generic,
     Cuda(bindings::cudaError_t),
     Cublas(bindings::cublasStatus_t),
     ExpectedIllegalAddressAccess,
@@ -201,8 +203,7 @@ impl BaseOperations for Buffer<f32> {
         mom: &mut Self,
         vel: &mut Self,
     ) -> Result<(), Self::BaseError> {
-        let AdamConfig { beta1, beta2, gradient_factor, learning_rate, denom } = *config;
-        dense::adam(size, self, grd, mom, vel, beta1, beta2, gradient_factor, learning_rate, denom)
+        dense::adam(size, self, grd, mom, vel, config)
     }
 
     fn clip(&mut self, size: usize, min: f32, max: f32) -> Result<(), Self::BaseError> {
@@ -236,6 +237,7 @@ impl Device for ExecutionContext {
         input_a_grad: &mut Self::BufferF32,
         shape_a: Shape,
         input_b: &Self::BufferI32,
+        input_b_vals: Option<&Self::BufferF32>,
         shape_b: Shape,
         nnz: usize,
         input_c: Option<&Self::BufferF32>,
@@ -252,6 +254,7 @@ impl Device for ExecutionContext {
             input_a_grad,
             shape_a,
             input_b,
+            input_b_vals,
             shape_b,
             nnz,
             input_c,
@@ -269,6 +272,7 @@ impl Device for ExecutionContext {
         input_a: &Self::BufferF32,
         shape_a: Shape,
         input_b: &Self::BufferI32,
+        input_b_vals: Option<&Self::BufferF32>,
         shape_b: Shape,
         nnz: usize,
         input_c: Option<&Self::BufferF32>,
@@ -282,6 +286,7 @@ impl Device for ExecutionContext {
             input_a,
             shape_a,
             input_b,
+            input_b_vals,
             shape_b,
             nnz,
             input_c,

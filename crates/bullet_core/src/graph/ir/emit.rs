@@ -132,15 +132,26 @@ fn op_args(
             Matmul(a, ta, b, tb) => format!("{}, {ta}, {}, {tb}", id(a), id(b)),
             PairwiseMul(input, post_concat) => format!("{}, {post_concat}", id(input)),
             PowerError(a, b, pow) => format!("{}, {}, {pow}", id(a), id(b)),
-            ReduceAcrossBatch(node) => id(node),
+            ReduceAcrossBatch(node, reduce) => format!("{}, {reduce:?}", id(node)),
             Select(input, buckets) => format!("{}, {}", id(input), id(buckets)),
             Slice(input, a, b) => format!("{}, {a}, {b}", id(input)),
-            SparseAffineActivate(w, i, b, act) => match (b, act) {
-                (Some(b), DiffableFromOutput::Identity) => format!("{}, {}, {}", id(w), id(i), id(b)),
-                (Some(b), _) => format!("{}, {}, {}, {act:?}", id(w), id(i), id(b)),
-                (None, DiffableFromOutput::Identity) => format!("{}, {}", id(w), id(i)),
-                (None, _) => format!("{}, {}, {act:?}", id(w), id(i)),
-            },
+            SparseAffineActivate(w, i, v, b, act) => {
+                let mut base = format!("{}, {}", id(w), id(i));
+
+                if let Some(v) = v {
+                    base = format!("{base}, {}", id(v));
+                }
+
+                if let Some(b) = b {
+                    base = format!("{base}, {}", id(b));
+                }
+
+                if *act != DiffableFromOutput::Identity {
+                    base = format!("{base}, {act:?}");
+                }
+
+                base
+            }
             ToDense(node) => id(node),
             Unary(node, unary) => match unary {
                 UnaryOp::DiffableFromOutput(_) => id(node),
@@ -174,7 +185,7 @@ fn op_name(node: &GraphIRNode) -> String {
 
     match node.parent_operation.as_ref() {
         Some(op) => match op {
-            SparseAffineActivate(_, _, b, act) => match (b, act) {
+            SparseAffineActivate(_, _, _, b, act) => match (b, act) {
                 (Some(_), DiffableFromOutput::Identity) => "SparseAffine",
                 (Some(_), _) => "SparseAffineActivate",
                 (None, DiffableFromOutput::Identity) => "SparseMatmul",

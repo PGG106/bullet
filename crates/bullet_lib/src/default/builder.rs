@@ -8,12 +8,12 @@ use crate::{
     Activation, ExecutionContext, Shape,
 };
 
-use crate::game::{
-    inputs::SparseInputType,
-    outputs::{self, OutputBuckets},
+use crate::{
+    game::{inputs::SparseInputType, outputs::OutputBuckets},
+    value::builder::{Bucket, NoOutputBuckets, OutputBucket},
 };
 
-use super::{AdditionalTrainerInputs, Trainer};
+use super::{loader::B, AdditionalTrainerInputs, Trainer, Wgt};
 
 use bullet_core::optimiser::Optimiser;
 
@@ -39,13 +39,16 @@ struct NodeType {
     op: OpType,
 }
 
-pub struct TrainerBuilder<T, U = outputs::Single, O = optimiser::AdamW> {
+pub struct TrainerBuilder<T: SparseInputType, U, O = optimiser::AdamW> {
     input_getter: Option<T>,
     bucket_getter: U,
+    blend_getter: B<T>,
+    weight_getter: Option<Wgt<T>>,
     ft_out_size: usize,
     nodes: Vec<NodeType>,
     quantisations: Option<Vec<QuantTarget>>,
     perspective: bool,
+    use_win_rate_model: Option<f32>,
     loss: Loss,
     optimiser: O,
     psqt_subnet: bool,
@@ -54,17 +57,21 @@ pub struct TrainerBuilder<T, U = outputs::Single, O = optimiser::AdamW> {
     output_bucket_ft_biases: bool,
     profile_ft: bool,
     compile_args: GraphCompileArgs,
+    quant_round: bool,
 }
 
-impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType> Default for TrainerBuilder<T, U, O> {
+impl<T: SparseInputType, O: OptimiserType> Default for TrainerBuilder<T, NoOutputBuckets, O> {
     fn default() -> Self {
         Self {
             input_getter: None,
-            bucket_getter: U::default(),
+            bucket_getter: NoOutputBuckets,
+            blend_getter: |_, wdl| wdl,
+            weight_getter: None,
             ft_out_size: 0,
             nodes: Vec::new(),
             quantisations: None,
             perspective: true,
+            use_win_rate_model: None,
             loss: Loss::None,
             optimiser: O::default(),
             psqt_subnet: false,
@@ -73,11 +80,12 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
             output_bucket_ft_biases: false,
             profile_ft: false,
             compile_args: GraphCompileArgs::default(),
+            quant_round: false,
         }
     }
 }
 
-impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType> TrainerBuilder<T, U, O> {
+impl<T: SparseInputType, U, O: OptimiserType> TrainerBuilder<T, U, O> {
     fn get_last_layer_size(&self) -> usize {
         if let Some(node) = self.nodes.last() {
             node.size
@@ -108,12 +116,6 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
         self
     }
 
-    /// Sets the output buckets.
-    pub fn output_buckets(mut self, bucket_getter: U) -> Self {
-        self.bucket_getter = bucket_getter;
-        self
-    }
-
     /// Provide a list of quantisations.
     pub fn quantisations(mut self, quants: &[i16]) -> Self {
         assert!(self.quantisations.is_none(), "Quantisations already set!");
@@ -125,6 +127,12 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
     pub fn advanced_quantisations(mut self, quants: &[QuantTarget]) -> Self {
         assert!(self.quantisations.is_none(), "Quantisations already set!");
         self.quantisations = Some(quants.to_vec());
+        self
+    }
+
+    /// Round rather than truncate when quantising.
+    pub fn round_in_quantisation(mut self) -> Self {
+        self.quant_round = true;
         self
     }
 
@@ -142,8 +150,18 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
     }
 
     pub fn output_bucket_ft_biases(mut self) -> Self {
-        assert!(U::BUCKETS > 1);
         self.output_bucket_ft_biases = true;
+        self
+    }
+
+    pub fn wdl_adjuster(mut self, b: B<T>) -> Self {
+        self.blend_getter = b;
+        self
+    }
+
+    pub fn datapoint_weight_function(mut self, f: Wgt<T>) -> Self {
+        assert!(self.weight_getter.is_none(), "Position weight function is already set!");
+        self.weight_getter = Some(f);
         self
     }
 
@@ -193,6 +211,11 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
         self.add(size, OpType::PairwiseMul)
     }
 
+    pub fn use_win_rate_model(mut self, scale: f32) -> Self {
+        self.use_win_rate_model = Some(scale);
+        self
+    }
+
     /// Applies the given activation function.
     pub fn activate(self, activation: Activation) -> Self {
         let size = self.get_last_layer_size();
@@ -233,12 +256,46 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
         self.compile_args = args;
         self
     }
+}
 
+impl<T: SparseInputType, O: OptimiserType> TrainerBuilder<T, NoOutputBuckets, O> {
+    /// Sets the output buckets.
+    pub fn output_buckets<U>(self, bucket_getter: U) -> TrainerBuilder<T, OutputBucket<U>, O>
+    where
+        U: OutputBuckets<T::RequiredDataType>,
+    {
+        TrainerBuilder {
+            input_getter: self.input_getter,
+            bucket_getter: OutputBucket(bucket_getter),
+            blend_getter: self.blend_getter,
+            weight_getter: self.weight_getter,
+            ft_out_size: self.ft_out_size,
+            nodes: self.nodes,
+            quantisations: self.quantisations,
+            perspective: self.perspective,
+            use_win_rate_model: self.use_win_rate_model,
+            loss: self.loss,
+            optimiser: self.optimiser,
+            psqt_subnet: self.psqt_subnet,
+            allow_transpose: self.allow_transpose,
+            ft_init_input_size: self.ft_init_input_size,
+            output_bucket_ft_biases: self.output_bucket_ft_biases,
+            profile_ft: self.profile_ft,
+            compile_args: self.compile_args,
+            quant_round: self.quant_round,
+        }
+    }
+}
+
+impl<T: SparseInputType, U: Bucket, O: OptimiserType> TrainerBuilder<T, U, O>
+where
+    U::Inner: OutputBuckets<T::RequiredDataType>,
+{
     fn push_saved_format(&self, layer: usize, shape: Shape, saved_format: &mut Vec<SavedFormat>, net_quant: &mut i16) {
         let w = format!("l{layer}w");
         let b = format!("l{layer}b");
 
-        let layout = if self.allow_transpose && layer > 0 && U::BUCKETS > 1 {
+        let layout = if self.allow_transpose && layer > 0 && U::Inner::BUCKETS > 1 {
             Layout::Transposed(shape)
         } else {
             Layout::Normal
@@ -266,26 +323,35 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
             (QuantTarget::Float, QuantTarget::Float)
         };
 
-        saved_format.push(SavedFormat::new(&w, wquant, layout));
-        saved_format.push(SavedFormat::new(&b, bquant, Layout::Normal));
+        let mut wfmt = SavedFormat::new(&w, wquant, layout);
+        let mut bfmt = SavedFormat::new(&b, bquant, Layout::Normal);
+
+        if self.quant_round {
+            wfmt = wfmt.round();
+            bfmt = bfmt.round();
+        }
+
+        saved_format.push(wfmt);
+        saved_format.push(bfmt);
     }
 
-    pub fn build(self) -> Trainer<O::Optimiser, T, U> {
+    pub fn build(self) -> Trainer<O::Optimiser, T, U::Inner> {
         let mut builder = NetworkBuilder::default();
 
-        let output_buckets = U::BUCKETS > 1;
+        let output_buckets = U::Inner::BUCKETS;
 
         let input_getter = self.input_getter.clone().expect("Need to set the input features!");
         let input_size = input_getter.num_inputs();
         let input_shape = Shape::new(input_size, 1);
 
         let mut out = builder.new_sparse_input("stm", input_shape, input_getter.max_active());
-        let buckets = output_buckets.then(|| builder.new_sparse_input("buckets", Shape::new(U::BUCKETS, 1), 1));
+        let buckets =
+            (output_buckets > 1).then(|| builder.new_sparse_input("buckets", Shape::new(output_buckets, 1), 1));
         let l0 = builder.new_affine_custom(
             "l0",
             input_size,
             self.ft_out_size,
-            if self.output_bucket_ft_biases { U::BUCKETS } else { 1 },
+            if self.output_bucket_ft_biases { output_buckets } else { 1 },
         );
 
         let mut still_in_ft = true;
@@ -347,7 +413,7 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
                 }
                 OpType::Affine => {
                     still_in_ft = false;
-                    let raw_size = size * U::BUCKETS;
+                    let raw_size = size * output_buckets;
 
                     let l = builder.new_affine(&format!("l{layer}"), prev_size, raw_size);
 
@@ -388,12 +454,31 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
         let output_node = out.node();
         let output_size = prev_size;
         let targets = builder.new_dense_input("targets", Shape::new(output_size, 1));
-        match self.loss {
-            Loss::None => panic!("No loss function specified!"),
-            Loss::SigmoidMSE => out.activate(Activation::Sigmoid).squared_error(targets),
-            Loss::SigmoidMPE(power) => out.activate(Activation::Sigmoid).power_error(targets, power),
-            Loss::SoftmaxCrossEntropy => out.softmax_crossentropy_loss(targets),
+
+        let raw_loss = if let Some(scale) = self.use_win_rate_model {
+            let score = (scale / 340.0) * out;
+            let q = score - (270.0 / 340.0);
+            let qm = -score - (270.0 / 340.0);
+            let wdl = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid());
+
+            match self.loss {
+                Loss::SigmoidMSE => wdl.squared_error(targets),
+                Loss::SigmoidMPE(power) => wdl.power_error(targets, power),
+                _ => panic!("Loss fn incompatible with use_win_rate_model!"),
+            }
+        } else {
+            match self.loss {
+                Loss::None => panic!("No loss function specified!"),
+                Loss::SigmoidMSE => out.sigmoid().squared_error(targets),
+                Loss::SigmoidMPE(power) => out.sigmoid().power_error(targets, power),
+                Loss::SoftmaxCrossEntropy => out.softmax_crossentropy_loss(targets),
+            }
         };
+
+        if self.weight_getter.is_some() {
+            let entry_weights = builder.new_dense_input("entry_weights", Shape::new(1, 1));
+            let _ = entry_weights * raw_loss;
+        }
 
         #[allow(clippy::default_constructed_unit_structs)]
         let ctx = ExecutionContext::default();
@@ -411,11 +496,11 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
             output_desc.push_str(&format!(" -> {size}"));
         }
 
-        if output_buckets {
+        if output_buckets > 1 {
             if layer_sizes.len() == 1 {
-                output_desc = format!("{output_desc}x{}", U::BUCKETS);
+                output_desc = format!("{output_desc}x{}", output_buckets);
             } else {
-                output_desc = format!("({output_desc})x{}", U::BUCKETS);
+                output_desc = format!("({output_desc})x{}", output_buckets);
             }
         }
 
@@ -434,7 +519,10 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
         let trainer = Trainer {
             optimiser: Optimiser::new(graph, Default::default()).unwrap(),
             input_getter: input_getter.clone(),
-            output_getter: self.bucket_getter,
+            output_getter: self.bucket_getter.inner(),
+            blend_getter: self.blend_getter,
+            weight_getter: self.weight_getter,
+            use_win_rate_model: self.use_win_rate_model.is_some(),
             output_node,
             additional_inputs: AdditionalTrainerInputs { wdl: output_size == 3 },
             saved_format: saved_format.clone(),
@@ -461,7 +549,7 @@ impl<T: SparseInputType, U: OutputBuckets<T::RequiredDataType>, O: OptimiserType
         println!("Input Layer Layout     : [[T; feature transformer size]; number of inputs]");
 
         print!("Output Layer Layout    : ");
-        if output_buckets {
+        if output_buckets > 1 {
             if self.allow_transpose {
                 println!("[[[T; layer input size]; layer output size]; output buckets]");
             } else {

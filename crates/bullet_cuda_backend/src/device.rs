@@ -3,19 +3,21 @@ mod sparse;
 use std::sync::Arc;
 
 use bullet_core::{
-    backend::device::{Device, OperationError, OperationResult},
+    backend::device::{Device, DeviceBuffer, OperationError, OperationResult},
     graph::ir::{op::DiffableFromOutput, shape::Shape},
 };
 use cudarc::{
     cublas::{result::CublasError, CudaBlas},
-    driver::{CudaContext, CudaModule, CudaStream, DriverError, LaunchConfig},
+    driver::{CudaContext, CudaModule, CudaStream, DriverError, LaunchConfig, PushKernelArg},
     nvrtc::Ptx,
 };
 
 use crate::CudaBuffer;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum CudaError {
+    #[default]
+    Generic,
     Driver(DriverError),
     Blas(CublasError),
     ExpectedIllegalAddressAccess,
@@ -35,7 +37,7 @@ impl Default for CudaDevice {
 
 impl CudaDevice {
     pub fn elementwise_launch_params(size: usize, threads: u32) -> LaunchConfig {
-        let float4_size = (size as u32 + 3) / 4;
+        let float4_size = (size as u32).div_ceil(4);
         let blocks = float4_size.div_ceil(threads);
         LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 }
     }
@@ -81,12 +83,17 @@ impl Device for CudaDevice {
         input_a: &Self::BufferF32,
         shape_a: Shape,
         input_b: &Self::BufferI32,
+        input_b_vals: Option<&Self::BufferF32>,
         shape_b: Shape,
         nnz: usize,
         input_c: Option<&Self::BufferF32>,
         input_c_batched: bool,
         output: &mut Self::BufferF32,
     ) -> OperationResult<Self::DeviceError> {
+        if input_b_vals.is_some() {
+            return Err(OperationError::UnsupportedOperation);
+        }
+
         sparse::sparse_affine(
             batch_size,
             stride,
@@ -110,6 +117,7 @@ impl Device for CudaDevice {
         input_a_grad: &mut Self::BufferF32,
         shape_a: Shape,
         input_b: &Self::BufferI32,
+        input_b_vals: Option<&Self::BufferF32>,
         shape_b: Shape,
         nnz: usize,
         input_c: Option<&Self::BufferF32>,
@@ -118,6 +126,10 @@ impl Device for CudaDevice {
         outputs: &Self::BufferF32,
         output_grad: &Self::BufferF32,
     ) -> OperationResult<Self::DeviceError> {
+        if input_b_vals.is_some() {
+            return Err(OperationError::UnsupportedOperation);
+        }
+
         sparse::backprop_sparse_affine(
             batch_size,
             stride,
@@ -166,7 +178,35 @@ impl Device for CudaDevice {
         indices: &Self::BufferI32,
         output: &mut Self::BufferF32,
     ) -> OperationResult<Self::DeviceError> {
-        Err(OperationError::UnsupportedOperation)
+        if batch_size * input_size > input.size()
+            || batch_size > indices.size()
+            || batch_size * output_size > output.size()
+        {
+            return OperationResult::Err(OperationError::IndexOutOfBounds);
+        }
+
+        let func = input.device.module.load_function("select").map_err(CudaError::Driver)?;
+
+        let threads = 1024;
+        let grid_dim = (((batch_size * output_size) as u32).div_ceil(threads), 1, 1);
+        let cfg = LaunchConfig { grid_dim, block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+
+        unsafe {
+            input
+                .device
+                .stream
+                .launch_builder(&func)
+                .arg(&(batch_size as i32))
+                .arg(&(input_size as i32))
+                .arg(&(output_size as i32))
+                .arg(&indices.buf)
+                .arg(&input.buf)
+                .arg(&mut output.buf)
+                .launch(cfg)
+                .map_err(CudaError::Driver)?;
+        }
+
+        Ok(())
     }
 
     fn select_backprop(
@@ -177,7 +217,35 @@ impl Device for CudaDevice {
         output_grad: &Self::BufferF32,
         input_grad: &mut Self::BufferF32,
     ) -> OperationResult<Self::DeviceError> {
-        Err(OperationError::UnsupportedOperation)
+        if batch_size * input_size > input_grad.size()
+            || batch_size > indices.size()
+            || batch_size * output_size > output_grad.size()
+        {
+            return OperationResult::Err(OperationError::IndexOutOfBounds);
+        }
+
+        let func = input_grad.device.module.load_function("select_backprop").map_err(CudaError::Driver)?;
+
+        let threads = 1024;
+        let grid_dim = (((batch_size * output_size) as u32).div_ceil(threads), 1, 1);
+        let cfg = LaunchConfig { grid_dim, block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+
+        unsafe {
+            input_grad
+                .device
+                .stream
+                .launch_builder(&func)
+                .arg(&(batch_size as i32))
+                .arg(&(input_size as i32))
+                .arg(&(output_size as i32))
+                .arg(&indices.buf)
+                .arg(&output_grad.buf)
+                .arg(&mut input_grad.buf)
+                .launch(cfg)
+                .map_err(CudaError::Driver)?;
+        }
+
+        Ok(())
     }
 
     fn gather(
