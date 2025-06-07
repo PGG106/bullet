@@ -80,7 +80,7 @@ fn main() {
             SavedFormat::id("l1w").quantise::<i16>(64).transpose(),
             SavedFormat::id("l1b").quantise::<i16>(255 * 64),
         ])
-        .loss_fn(|output, target| output.sigmoid().squared_error(target))
+        .loss_fn(|output, target| output.sigmoid().power_error(target, 2.5))
         .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
             // input layer factoriser
             let l0f = builder.new_weights("l0f", Shape::new(hl_size, 768), InitSettings::Zeroed);
