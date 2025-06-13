@@ -25,6 +25,7 @@ bulletformat = { workspace = true }
 montyformat = { workspace = true }
 sfbinpack = "0.4.1"
 viriformat = "2.0.0"
+rand = "0.9.1"
 
 [[example]]
 name = "advanced"
