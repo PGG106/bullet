@@ -1,26 +1,26 @@
 use bullet_lib::{
     game::{
-        inputs::{get_num_buckets, ChessBucketsMirrored},
+        inputs::{ChessBucketsMirrored, get_num_buckets},
         outputs::MaterialCount,
     },
     nn::{
-        optimiser::{AdamW, AdamWParams},
         InitSettings, Shape,
+        optimiser::{AdamW, AdamWParams},
     },
     trainer::{
-        save::SavedFormat,
-        schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
-        settings::LocalSettings,
         NetworkTrainer,
+        save::SavedFormat,
+        schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
+        settings::LocalSettings,
     },
-    value::{loader::DirectSequentialDataLoader, ValueTrainerBuilder},
+    value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
 
 use bullet_lib::value::loader::SfBinpackLoader;
-use sfbinpack::chess::piecetype::PieceType;
-use sfbinpack::chess::r#move::MoveType;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use sfbinpack::TrainingDataEntry;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use sfbinpack::chess::r#move::MoveType;
+use sfbinpack::chess::piecetype::PieceType;
 
 #[derive(Clone, Copy, Default)]
 pub struct CJBucket;
@@ -62,7 +62,7 @@ fn win_rate_model(v: i16, pos: &sfbinpack::chess::position::Position) -> u16 {
     let (a, b) = win_rate_params(pos);
 
     // Return the win rate in per mille units, rounded to the nearest integer.
-   let win_rate = (0.5 + 1000.0 / (1.0 + ((a - v as f64) / b).exp())).round() as u16;
+    let win_rate = (0.5 + 1000.0 / (1.0 + ((a - v as f64) / b).exp())).round() as u16;
 
     win_rate
 }
@@ -173,7 +173,7 @@ fn main() {
     trainer.optimiser_mut().set_params_for_weight("l0f", stricter_clipping);
 
     let schedule = TrainingSchedule {
-        net_id: "masternet".to_string(),
+        net_id: "masternet-wdl".to_string(),
         eval_scale: 400.0,
         steps: TrainingSteps {
             batch_size: 16_384,
