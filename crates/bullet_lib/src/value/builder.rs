@@ -1,27 +1,24 @@
 use std::marker::PhantomData;
 
-use bullet_core::{
-    graph::{builder::Shape, ir::args::GraphIRCompileArgs},
-    optimiser::Optimiser,
-};
+use bullet_core::{graph::builder::Shape, optimiser::Optimiser, trainer::Trainer};
 
 use crate::{
-    default::{AdditionalTrainerInputs, Wgt},
     game::{inputs::SparseInputType, outputs::OutputBuckets},
-    nn::{optimiser::OptimiserType, NetworkBuilder, NetworkBuilderNode},
+    nn::{optimiser::OptimiserType, BackendMarker, NetworkBuilder, NetworkBuilderNode},
     trainer::save::SavedFormat,
+    value::ValueTrainerState,
     ExecutionContext,
 };
 
-use super::{loader::B, ValueTrainer};
+use super::{ValueTrainer, B};
 
+type Wgt<I> = fn(&<I as SparseInputType>::RequiredDataType) -> f32;
 type LossFn = for<'a> fn(Nbn<'a>, Nbn<'a>) -> Nbn<'a>;
 
 pub struct ValueTrainerBuilder<O, I: SparseInputType, P, Out> {
     input_getter: Option<I>,
     saved_format: Option<Vec<SavedFormat>>,
     optimiser: Option<O>,
-    compile_args: Option<GraphIRCompileArgs>,
     perspective: PhantomData<P>,
     output_buckets: Out,
     blend_getter: B<I>,
@@ -29,6 +26,7 @@ pub struct ValueTrainerBuilder<O, I: SparseInputType, P, Out> {
     loss_fn: Option<LossFn>,
     factorised: Vec<String>,
     wdl_output: bool,
+    use_win_rate_model: bool,
 }
 
 impl<O, I> Default for ValueTrainerBuilder<O, I, SinglePerspective, NoOutputBuckets>
@@ -40,13 +38,13 @@ where
             input_getter: None,
             saved_format: None,
             optimiser: None,
-            compile_args: None,
             perspective: PhantomData,
             output_buckets: NoOutputBuckets,
             blend_getter: |_, wdl| wdl,
             weight_getter: None,
             loss_fn: None,
             wdl_output: false,
+            use_win_rate_model: false,
             factorised: Vec::new(),
         }
     }
@@ -66,11 +64,6 @@ where
     pub fn optimiser(mut self, optimiser: O) -> Self {
         assert!(self.optimiser.is_none(), "Optimiser already set!");
         self.optimiser = Some(optimiser);
-        self
-    }
-
-    pub fn compile_args(mut self, args: GraphIRCompileArgs) -> Self {
-        self.compile_args = Some(args);
         self
     }
 
@@ -110,9 +103,14 @@ where
         self
     }
 
+    pub fn use_win_rate_model(mut self) -> Self {
+        self.use_win_rate_model = true;
+        self
+    }
+
     fn build_custom_internal<F>(self, f: F) -> ValueTrainer<O::Optimiser, I, Out::Inner>
     where
-        F: for<'a> Fn(usize, usize, Nbn<'a>, &'a NetworkBuilder) -> (Nbn<'a>, Nbn<'a>),
+        F: for<'a> Fn(usize, usize, Nbn<'a>, Nb<'a>) -> (Nbn<'a>, Nbn<'a>),
         Out: Bucket,
         Out::Inner: OutputBuckets<I::RequiredDataType>,
     {
@@ -123,11 +121,7 @@ where
         let inputs = input_getter.num_inputs();
         let nnz = input_getter.max_active();
 
-        let mut builder = NetworkBuilder::default();
-
-        if let Some(args) = self.compile_args {
-            builder.set_compile_args(args);
-        }
+        let builder = NetworkBuilder::default();
 
         let output_size = if self.wdl_output { 3 } else { 1 };
         let targets = builder.new_dense_input("targets", Shape::new(output_size, 1));
@@ -141,23 +135,24 @@ where
         let output_node = out.node();
         let graph = builder.build(ExecutionContext::default());
 
-        ValueTrainer {
+        ValueTrainer(Trainer {
             optimiser: Optimiser::new(graph, Default::default()).unwrap(),
-            input_getter: input_getter.clone(),
-            output_getter: buckets,
-            blend_getter: self.blend_getter,
-            weight_getter: self.weight_getter,
-            use_win_rate_model: false,
-            output_node,
-            additional_inputs: AdditionalTrainerInputs { wdl: output_size == 3 },
-            saved_format: saved_format.clone(),
-            factorised_weights: (!self.factorised.is_empty()).then_some(self.factorised),
-        }
+            state: ValueTrainerState {
+                input_getter: input_getter.clone(),
+                output_getter: buckets,
+                blend_getter: self.blend_getter,
+                weight_getter: self.weight_getter,
+                output_node,
+                use_win_rate_model: self.use_win_rate_model,
+                wdl: self.wdl_output,
+                saved_format: saved_format.clone(),
+            },
+        })
     }
 
     fn build_internal<F>(self, f: F) -> ValueTrainer<O::Optimiser, I, Out::Inner>
     where
-        F: for<'a> Fn(usize, usize, &'a NetworkBuilder) -> NetworkBuilderNode<'a>,
+        F: for<'a> Fn(usize, usize, Nb<'a>) -> Nbn<'a>,
         Out: Bucket,
         Out::Inner: OutputBuckets<I::RequiredDataType>,
     {
@@ -226,7 +221,6 @@ where
             input_getter: self.input_getter,
             saved_format: self.saved_format,
             optimiser: self.optimiser,
-            compile_args: self.compile_args,
             perspective: PhantomData,
             output_buckets: self.output_buckets,
             blend_getter: self.blend_getter,
@@ -234,6 +228,7 @@ where
             loss_fn: self.loss_fn,
             factorised: self.factorised,
             wdl_output: self.wdl_output,
+            use_win_rate_model: self.use_win_rate_model,
         }
     }
 }
@@ -253,7 +248,6 @@ where
             input_getter: self.input_getter,
             saved_format: self.saved_format,
             optimiser: self.optimiser,
-            compile_args: self.compile_args,
             perspective: self.perspective,
             output_buckets: OutputBucket(buckets),
             blend_getter: self.blend_getter,
@@ -261,12 +255,13 @@ where
             loss_fn: self.loss_fn,
             factorised: self.factorised,
             wdl_output: self.wdl_output,
+            use_win_rate_model: self.use_win_rate_model,
         }
     }
 }
 
-type Nb<'a> = &'a NetworkBuilder;
-type Nbn<'a> = NetworkBuilderNode<'a>;
+type Nb<'a> = &'a NetworkBuilder<BackendMarker>;
+type Nbn<'a> = NetworkBuilderNode<'a, BackendMarker>;
 
 impl<O, I> ValueTrainerBuilder<O, I, SinglePerspective, NoOutputBuckets>
 where

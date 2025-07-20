@@ -1,11 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::backend::{
+use crate::{
     device::{
         base::{AdamConfig, BaseOperations},
         Device, OperationError,
     },
-    tensor::DenseMatrix,
+    graph::tensor::DenseMatrix,
 };
 
 use super::{utils, OptimiserState};
@@ -78,8 +78,8 @@ impl<D: Device> OptimiserState<D> for AdamW<D> {
     }
 
     fn reset(&mut self) -> Result<(), D::DeviceError> {
-        self.momentum.set_zero()?;
-        self.velocity.set_zero()
+        self.momentum.set_to(0.0)?;
+        self.velocity.set_to(0.0)
     }
 
     fn write_to_checkpoint(map: &HashMap<String, &Self>, path: &str) -> Result<(), D::DeviceError> {

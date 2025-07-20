@@ -35,8 +35,12 @@ name = "simple"
 path = "../../examples/simple.rs"
 
 [[example]]
-name = "testnet"
-path = "../../examples/testnet.rs"
+name = "test1"
+path = "../../examples/tests/test1.rs"
+
+[[example]]
+name = "test2"
+path = "../../examples/tests/test2.rs"
 
 [[example]]
 name = "morelayers"
@@ -53,14 +57,6 @@ path = "../../examples/alexandria-morelayers.rs"
 [[example]]
 name = "akimbo-main"
 path = "../../examples/extra/akimbo-main.rs"
-
-[[example]]
-name = "ataxx"
-path = "../../examples/extra/ataxx.rs"
-
-[[example]]
-name = "policy"
-path = "../../examples/extra/policy.rs"
 
 [[example]]
 name = "1_simple"

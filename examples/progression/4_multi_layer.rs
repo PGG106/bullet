@@ -11,7 +11,6 @@ use bullet_lib::{
         save::SavedFormat,
         schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
         settings::LocalSettings,
-        NetworkTrainer,
     },
     value::{loader::DirectSequentialDataLoader, ValueTrainerBuilder},
 };
@@ -46,8 +45,8 @@ fn main() {
         .output_buckets(MaterialCount::<NUM_OUTPUT_BUCKETS>)
         .save_format(&[
             SavedFormat::id("l0w")
-                .add_transform(|builder, _, mut weights| {
-                    let factoriser = builder.get_weights("l0f").get_dense_vals().unwrap();
+                .add_transform(|graph, _, mut weights| {
+                    let factoriser = graph.get_weights("l0f").get_dense_vals().unwrap();
                     let expanded = factoriser.repeat(NUM_INPUT_BUCKETS);
 
                     for (i, &j) in weights.iter_mut().zip(expanded.iter()) {
@@ -92,8 +91,8 @@ fn main() {
 
     // need to account for factoriser weight magnitudes
     let stricter_clipping = AdamWParams { max_weight: 0.99, min_weight: -0.99, ..Default::default() };
-    trainer.optimiser_mut().set_params_for_weight("l0w", stricter_clipping);
-    trainer.optimiser_mut().set_params_for_weight("l0f", stricter_clipping);
+    trainer.optimiser.set_params_for_weight("l0w", stricter_clipping);
+    trainer.optimiser.set_params_for_weight("l0f", stricter_clipping);
 
     let schedule = TrainingSchedule {
         net_id: "4_multi_layer".to_string(),

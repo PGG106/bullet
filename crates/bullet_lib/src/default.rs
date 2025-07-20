@@ -1,6 +1,7 @@
+#![allow(deprecated)]
+
 mod builder;
 pub mod gamerunner;
-pub mod loader;
 pub mod testing;
 
 /// Re-exports crates for certain file formats (e.g. Bulletformat)
@@ -10,10 +11,13 @@ pub mod formats {
     pub use sfbinpack;
 }
 
-pub use crate::game::{inputs, outputs};
+pub use crate::{
+    game::{inputs, outputs},
+    value::loader,
+};
 pub use builder::{Loss, TrainerBuilder};
 
-use loader::{
+use crate::value::loader::{
     load_into_graph, CanBeDirectlySequentiallyLoaded, DataLoader, DefaultDataLoader, DefaultDataPreparer,
     DirectSequentialDataLoader, LoadableDataType, B,
 };
@@ -38,14 +42,9 @@ use crate::{
 };
 
 use bullet_core::{
-    graph::{Graph, Node},
+    graph::{Graph, Node, NodeId, NodeIdTy},
     optimiser::{Optimiser, OptimiserState},
 };
-
-unsafe impl CanBeDirectlySequentiallyLoaded for bulletformat::ChessBoard {}
-unsafe impl CanBeDirectlySequentiallyLoaded for bulletformat::AtaxxBoard {}
-unsafe impl CanBeDirectlySequentiallyLoaded for bulletformat::chess::CudADFormat {}
-unsafe impl CanBeDirectlySequentiallyLoaded for bulletformat::chess::MarlinFormat {}
 
 #[derive(Clone, Copy)]
 pub struct AdditionalTrainerInputs {
@@ -192,9 +191,10 @@ impl<Opt: OptimiserState<ExecutionContext>, Inp: SparseInputType, Out: OutputBuc
         self.load_batch(&prepared);
         self.optimiser.graph.forward().unwrap();
 
-        let eval = self.optimiser.graph.get_node(self.output_node);
+        let id = NodeId::new(self.output_node.idx(), NodeIdTy::Values);
+        let eval = self.optimiser.graph.get(id).unwrap();
 
-        let dense_vals = eval.values.dense().unwrap();
+        let dense_vals = eval.dense().unwrap();
         let mut vals = vec![0.0; dense_vals.size()];
         dense_vals.write_to_slice(&mut vals).unwrap();
         vals
@@ -238,26 +238,15 @@ impl<Opt: OptimiserState<ExecutionContext>, Inp: SparseInputType, Out: OutputBuc
         }
     }
 
-    pub fn profile_node(&mut self, node: Node, id: &str) {
-        self.optimiser.graph.profile_node(node, id);
-    }
-
-    pub fn profile_all_nodes(&mut self) {
-        self.optimiser.graph.profile_all_nodes();
-    }
-
-    pub fn report_profiles(&self) {
-        self.optimiser.graph.report_profiles();
-    }
-
     pub fn save_quantised(&self, path: &str) -> io::Result<()> {
         let mut file = File::create(path).unwrap();
 
         let mut buf = Vec::new();
 
         for SavedFormat { id, quant, layout, transforms, round } in &self.saved_format {
-            let weights = self.optimiser.graph.get_weights(id);
-            let weights = weights.values.dense().unwrap();
+            let idx = NodeId::new(self.optimiser.graph.weight_idx(id).unwrap(), NodeIdTy::Values);
+            let weights = self.optimiser.graph.get(idx).unwrap();
+            let weights = weights.dense().unwrap();
 
             let mut weight_buf = vec![0.0; weights.size()];
             let written = weights.write_to_slice(&mut weight_buf).unwrap();
@@ -288,7 +277,7 @@ impl<Opt: OptimiserState<ExecutionContext>, Inp: SparseInputType, Out: OutputBuc
             let quantised = match quant.quantise(*round, &weight_buf) {
                 Ok(q) => q,
                 Err(err) => {
-                    println!("Quantisation failed for id: {}", id);
+                    println!("Quantisation failed for id: {id}");
                     return Err(err);
                 }
             };
@@ -316,8 +305,9 @@ impl<Opt: OptimiserState<ExecutionContext>, Inp: SparseInputType, Out: OutputBuc
         let mut buf = Vec::new();
 
         for SavedFormat { id, .. } in &self.saved_format {
-            let weights = self.optimiser.graph.get_weights(id);
-            let weights = weights.values.dense().unwrap();
+            let id = NodeId::new(self.optimiser.graph.weight_idx(id).unwrap(), NodeIdTy::Values);
+            let weights = self.optimiser.graph.get(id).unwrap();
+            let weights = weights.dense().unwrap();
 
             let mut weight_buf = vec![0.0; weights.size()];
             let written = weights.write_to_slice(&mut weight_buf).unwrap();
