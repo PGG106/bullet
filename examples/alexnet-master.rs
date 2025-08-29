@@ -1,7 +1,6 @@
 use bullet_lib::{
     game::{
         inputs::{ChessBucketsMirrored, get_num_buckets},
-        outputs::MaterialCount,
     },
     nn::{
         InitSettings, Shape,
@@ -13,7 +12,7 @@ use bullet_lib::{
         schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
         settings::LocalSettings,
     },
-    value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
+    value::{ValueTrainerBuilder},
 };
 
 use bullet_lib::value::loader::SfBinpackLoader;
@@ -99,14 +98,13 @@ fn shouldkeep(result: i16, v: i16, pos: &sfbinpack::chess::position::Position) -
     random_number > 1000 - keep_prob
 }
 
+
 fn main() {
     // hyperparams to fiddle with
     let hl_size = 1536;
     let dataset_path = "data/master.binpack";
-    let initial_lr = 0.001;
-    // currently does nothing
-    let final_lr = 0.001 * 0.3f32.powi(5);
-    let superbatches = 800;
+    const STAGE1_SB: usize = 800;
+    const STAGE2_SB: usize = 100;
     let wdl_proportion = 0.0;
     // currently does nothing
     const NUM_OUTPUT_BUCKETS: usize = 8;
@@ -173,16 +171,32 @@ fn main() {
     trainer.optimiser_mut().set_params_for_weight("l0f", stricter_clipping);
 
     let schedule = TrainingSchedule {
-        net_id: "masternet-wdl".to_string(),
+        net_id: "masternet-wdl-retrain".to_string(),
         eval_scale: 400.0,
         steps: TrainingSteps {
             batch_size: 16_384,
             batches_per_superbatch: 6104,
             start_superbatch: 1,
-            end_superbatch: superbatches,
+            end_superbatch:  STAGE1_SB + STAGE2_SB,
         },
-        wdl_scheduler: wdl::ConstantWDL { value: wdl_proportion },
-        lr_scheduler: lr::CosineDecayLR { initial_lr, final_lr, final_superbatch: superbatches },
+        wdl_scheduler: wdl::Sequence { 
+            first: wdl::ConstantWDL { value: 0.0 },
+            second: wdl::ConstantWDL { value: 0.1 },
+            first_scheduler_final_superbatch: STAGE1_SB,
+        },
+        lr_scheduler: lr::Sequence { 
+            first: lr::CosineDecayLR { 
+                initial_lr: 0.001, 
+                final_lr: 0.001 * 0.3 * 0.3 * 0.3, 
+                final_superbatch: STAGE1_SB 
+            },
+            second: lr::CosineDecayLR { 
+                initial_lr: 0.001 * 0.3 * 0.3 * 0.3, 
+                final_lr: 0.001 * 0.3 * 0.3 * 0.3 * 0.1, 
+                final_superbatch: STAGE2_SB 
+            },
+            first_scheduler_final_superbatch: STAGE1_SB,
+        },
         //lr_scheduler: lr::StepLR { start: 0.001, gamma: 0.1, step: 160 },
         save_rate: 80,
     };
@@ -225,7 +239,7 @@ fn main() {
     // loading directly from a `BulletFormat` file
     //let dataloader = loader::DirectSequentialDataLoader::new(&["data/baseline.data"]);
 
-    // trainer.load_from_checkpoint("checkpoints\\masternet-720");
+    // trainer.load_from_checkpoint("checkpoints\\masternet-800");
 
     //trainer.save_to_checkpoint("checkpoints\\fixed-shit");
 
