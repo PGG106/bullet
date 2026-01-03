@@ -15,12 +15,12 @@ use bullet_lib::{
     value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
 };
 
+use bullet_lib::game::outputs::OutputBuckets;
 use bullet_lib::value::loader::SfBinpackLoader;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use sfbinpack::TrainingDataEntry;
 use sfbinpack::chess::r#move::MoveType;
 use sfbinpack::chess::piecetype::PieceType;
-use bullet_lib::game::outputs::OutputBuckets;
 
 #[derive(Clone, Copy, Default)]
 pub struct CJBucket;
@@ -99,7 +99,6 @@ fn shouldkeep(result: i16, v: i16, pos: &sfbinpack::chess::position::Position) -
     random_number > 1000 - keep_prob
 }
 
-
 fn main() {
     // hyperparams to fiddle with
     let hl_size = 1536;
@@ -107,8 +106,9 @@ fn main() {
     let l2 = 16;
     let l3 = 32;
     let dataset_path = "data/master.binpack";
+    let S1_initial_lr = 0.001;
+    let S1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
     const STAGE1_SB: usize = 800;
-    const STAGE2_SB: usize = 100;
     // currently does nothing
     const NUM_OUTPUT_BUCKETS: usize = 8;
     #[rustfmt::skip]
@@ -152,7 +152,7 @@ fn main() {
             l0.init_with_effective_input_size(32);
             l0.weights = (l0.weights + expanded_factoriser).clip_pass_through_grad(-CLIP, CLIP);
 
-           // layerstack weights
+            // layerstack weights
             let l1 = builder.new_affine("l1", hl_size, NUM_OUTPUT_BUCKETS * l2);
             let l2 = builder.new_affine("l2", l2, NUM_OUTPUT_BUCKETS * l3);
             let l3 = builder.new_affine("l3", l3, NUM_OUTPUT_BUCKETS);
@@ -166,6 +166,24 @@ fn main() {
             l3.forward(hl3).select(output_buckets)
         });
 
+    let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..optimiser };
+
+    trainer.optimiser_mut().set_params_for_weight("l2w", no_clipping);
+    trainer.optimiser_mut().set_params_for_weight("l2b", no_clipping);
+    trainer.optimiser_mut().set_params_for_weight("l3w", no_clipping);
+    trainer.optimiser_mut().set_params_for_weight("l3b", no_clipping);
+
+    let wdl_scheduler = wdl::Sequence {
+        first: wdl::ConstantWDL { value: 0.0 },
+        second: wdl::ConstantWDL { value: 0.1 },
+        first_scheduler_final_superbatch: STAGE1_SB,
+    };
+
+    let lr_scheduler = lr::Warmup {
+        inner: lr::CosineDecayLR { S1_initial_lr, final_lr: S1_final_lr, final_superbatch: STAGE1_SB },
+        warmup_batches: 800,
+    };
+
     let schedule = TrainingSchedule {
         net_id: "moarlayers".to_string(),
         eval_scale: 362.0,
@@ -173,27 +191,10 @@ fn main() {
             batch_size: 16_384,
             batches_per_superbatch: 6104,
             start_superbatch: 1,
-            end_superbatch:  STAGE1_SB + STAGE2_SB,
+            end_superbatch: STAGE1_SB,
         },
-        wdl_scheduler: wdl::Sequence { 
-            first: wdl::ConstantWDL { value: 0.0 },
-            second: wdl::ConstantWDL { value: 0.1 },
-            first_scheduler_final_superbatch: STAGE1_SB,
-        },
-        lr_scheduler: lr::Sequence { 
-            first: lr::CosineDecayLR { 
-                initial_lr: 0.001, 
-                final_lr: 0.001 * 0.3 * 0.3 * 0.3, 
-                final_superbatch: STAGE1_SB 
-            },
-            second: lr::CosineDecayLR { 
-                initial_lr: 0.001 * 0.3 * 0.3 * 0.3, 
-                final_lr: 0.001 * 0.3 * 0.3 * 0.3 * 0.1, 
-                final_superbatch: STAGE2_SB 
-            },
-            first_scheduler_final_superbatch: STAGE1_SB,
-        },
-        //lr_scheduler: lr::StepLR { start: 0.001, gamma: 0.1, step: 160 },
+        wdl_scheduler,
+        lr_scheduler,
         save_rate: 80,
     };
 
