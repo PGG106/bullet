@@ -166,12 +166,12 @@ fn main() {
             l3.forward(hl3).select(output_buckets)
         });
 
-    let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..optimiser };
+    let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default()};
 
-    trainer.optimiser_mut().set_params_for_weight("l2w", no_clipping);
-    trainer.optimiser_mut().set_params_for_weight("l2b", no_clipping);
-    trainer.optimiser_mut().set_params_for_weight("l3w", no_clipping);
-    trainer.optimiser_mut().set_params_for_weight("l3b", no_clipping);
+    trainer.optimiser.set_params_for_weight("l2w", no_clipping);
+    trainer.optimiser.set_params_for_weight("l2b", no_clipping);
+    trainer.optimiser.set_params_for_weight("l3w", no_clipping);
+    trainer.optimiser.set_params_for_weight("l3b", no_clipping);
 
     let wdl_scheduler = wdl::Sequence {
         first: wdl::ConstantWDL { value: 0.0 },
@@ -180,7 +180,7 @@ fn main() {
     };
 
     let lr_scheduler = lr::Warmup {
-        inner: lr::CosineDecayLR { S1_initial_lr: s1_initial_lr, final_lr: s1_final_lr, final_superbatch: STAGE1_SB },
+        inner: lr::CosineDecayLR { initial_lr: s1_initial_lr, final_lr: s1_final_lr, final_superbatch: STAGE1_SB },
         warmup_batches: 800,
     };
 
