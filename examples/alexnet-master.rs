@@ -106,8 +106,8 @@ fn main() {
     let l2 = 16;
     let l3 = 32;
     let dataset_path = "data/master.binpack";
-    let S1_initial_lr = 0.001;
-    let S1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
+    let s1_initial_lr = 0.001;
+    let s1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
     const STAGE1_SB: usize = 800;
     // currently does nothing
     const NUM_OUTPUT_BUCKETS: usize = 8;
@@ -180,7 +180,7 @@ fn main() {
     };
 
     let lr_scheduler = lr::Warmup {
-        inner: lr::CosineDecayLR { S1_initial_lr, final_lr: S1_final_lr, final_superbatch: STAGE1_SB },
+        inner: lr::CosineDecayLR { S1_initial_lr: s1_initial_lr, final_lr: s1_final_lr, final_superbatch: STAGE1_SB },
         warmup_batches: 800,
     };
 
