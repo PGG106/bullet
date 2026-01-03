@@ -172,7 +172,7 @@ fn main() {
         steps: TrainingSteps {
             batch_size: 16_384,
             batches_per_superbatch: 6104,
-            start_superbatch: 80,
+            start_superbatch: 1,
             end_superbatch:  STAGE1_SB + STAGE2_SB,
         },
         wdl_scheduler: wdl::Sequence { 
@@ -235,7 +235,7 @@ fn main() {
     // loading directly from a `BulletFormat` file
     //let dataloader = loader::DirectSequentialDataLoader::new(&["data/baseline.data"]);
 
-    trainer.load_from_checkpoint("checkpoints\\moarlayers-80");
+    // trainer.load_from_checkpoint("checkpoints\\moarlayers-80");
 
     //trainer.save_to_checkpoint("checkpoints\\fixed-shit");
 
