@@ -23,12 +23,17 @@ bullet_cuda_backend = { workspace = true, optional = true }
 bullet_hip_backend = { workspace = true, optional = true }
 bulletformat = { workspace = true }
 montyformat = { workspace = true }
+rand = "0.9.2"
 sfbinpack = "0.6.0"
 viriformat = { workspace = true }
 
 [[example]]
 name = "simple"
 path = "../../examples/simple.rs"
+
+[[example]]
+name = "alexnet"
+path = "../../examples/alexnet-master.rs"
 
 [[example]]
 name = "mnist"
