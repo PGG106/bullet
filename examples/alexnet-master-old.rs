@@ -35,6 +35,7 @@ impl OutputBuckets<bulletformat::ChessBoard> for CJBucket {
     }
 }
 
+
 fn get_wdl(v: i16, pos: &sfbinpack::chess::position::Position) -> (f64, f64, f64) {
     let m = (pos.ply().min(240) as f64) / 64.0;
 
@@ -79,13 +80,11 @@ fn shouldkeep(result: i16, v: i16, pos: &sfbinpack::chess::position::Position) -
 fn main() {
     // hyperparams to fiddle with
     let hl_size = 1536;
-    const CLIP: f32 = 1.98;
-    let l2 = 16;
-    let l3 = 32;
+    let CLIP = 1.98;
     let dataset_path = "data/master.binpack";
-    let s1_initial_lr = 0.001;
-    let s1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
     const STAGE1_SB: usize = 800;
+    const STAGE2_SB: usize = 100;
+    let wdl_proportion = 0.0;
     // currently does nothing
     const NUM_OUTPUT_BUCKETS: usize = 8;
     #[rustfmt::skip]
@@ -108,15 +107,22 @@ fn main() {
         .inputs(ChessBucketsMirrored::new(BUCKET_LAYOUT))
         .output_buckets(CJBucket)
         .save_format(&[
-            SavedFormat::id("l0f"),
-            SavedFormat::id("l0w"),
-            SavedFormat::id("l0b"),
-            SavedFormat::id("l1w"),
-            SavedFormat::id("l1b"),
-            SavedFormat::id("l2w"),
-            SavedFormat::id("l2b"),
-            SavedFormat::id("l3w"),
-            SavedFormat::id("l3b"),
+            // merge in the factoriser weights
+            SavedFormat::id("l0w")
+                .add_transform(|builder, _, mut weights| {
+                    let factoriser = builder.get("l0f").values;
+                    let expanded = factoriser.repeat(NUM_INPUT_BUCKETS);
+
+                    for (i, &j) in weights.iter_mut().zip(expanded.iter()) {
+                        *i += j;
+                    }
+
+                    weights
+                })
+                .quantise::<i16>(255),
+            SavedFormat::id("l0b").quantise::<i16>(255),
+            SavedFormat::id("l1w").quantise::<i16>(64).transpose(),
+            SavedFormat::id("l1b").quantise::<i16>(255 * 64),
         ])
         .loss_fn(|output, target| output.sigmoid().power_error(target, 2.5))
         .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
@@ -129,49 +135,44 @@ fn main() {
             l0.init_with_effective_input_size(32);
             l0.weights = (l0.weights + expanded_factoriser).clip_pass_through_grad(-CLIP, CLIP);
 
-            // layerstack weights
-            let l1 = builder.new_affine("l1", hl_size, NUM_OUTPUT_BUCKETS * l2);
-            let l2 = builder.new_affine("l2", l2, NUM_OUTPUT_BUCKETS * l3);
-            let l3 = builder.new_affine("l3", l3, NUM_OUTPUT_BUCKETS);
+            // output layer weights
+            let l1 = builder.new_affine("l1", 2 * hl_size, NUM_OUTPUT_BUCKETS);
 
             // inference
-            let stm_hidden = l0.forward(stm_inputs).crelu().pairwise_mul();
-            let ntm_hidden = l0.forward(ntm_inputs).crelu().pairwise_mul();
-            let hl1 = stm_hidden.concat(ntm_hidden);
-            let hl2 = l1.forward(hl1).select(output_buckets).screlu();
-            let hl3 = l2.forward(hl2).select(output_buckets).screlu();
-            l3.forward(hl3).select(output_buckets)
+            let stm_hidden = l0.forward(stm_inputs).screlu();
+            let ntm_hidden = l0.forward(ntm_inputs).screlu();
+            let hidden_layer = stm_hidden.concat(ntm_hidden);
+            l1.forward(hidden_layer).select(output_buckets)
         });
 
-    let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default()};
-
-    trainer.optimiser.set_params_for_weight("l2w", no_clipping);
-    trainer.optimiser.set_params_for_weight("l2b", no_clipping);
-    trainer.optimiser.set_params_for_weight("l3w", no_clipping);
-    trainer.optimiser.set_params_for_weight("l3b", no_clipping);
-
-    let wdl_scheduler = wdl::Sequence {
-        first: wdl::ConstantWDL { value: 0.0 },
-        second: wdl::ConstantWDL { value: 0.1 },
-        first_scheduler_final_superbatch: STAGE1_SB,
-    };
-
-    let lr_scheduler = lr::Warmup {
-        inner: lr::CosineDecayLR { initial_lr: s1_initial_lr, final_lr: s1_final_lr, final_superbatch: STAGE1_SB },
-        warmup_batches: 800,
-    };
-
     let schedule = TrainingSchedule {
-        net_id: "masternet".to_string(),
-        eval_scale: 362.0,
+        net_id: "masternet-fixed-wdl2".to_string(),
+        eval_scale: 400.0,
         steps: TrainingSteps {
             batch_size: 16_384,
             batches_per_superbatch: 6104,
             start_superbatch: 1,
-            end_superbatch: STAGE1_SB,
+            end_superbatch:  STAGE1_SB,
         },
-        wdl_scheduler,
-        lr_scheduler,
+        wdl_scheduler: wdl::Sequence { 
+            first: wdl::ConstantWDL { value: 0.0 },
+            second: wdl::ConstantWDL { value: 0.1 },
+            first_scheduler_final_superbatch: STAGE1_SB,
+        },
+        lr_scheduler: lr::Sequence { 
+            first: lr::CosineDecayLR { 
+                initial_lr: 0.001, 
+                final_lr: 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3, 
+                final_superbatch: STAGE1_SB 
+            },
+            second: lr::CosineDecayLR { 
+                initial_lr: 0.001 * 0.3 * 0.3 * 0.3, 
+                final_lr: 0.001 * 0.3 * 0.3 * 0.3 * 0.1, 
+                final_superbatch: STAGE2_SB 
+            },
+            first_scheduler_final_superbatch: STAGE1_SB,
+        },
+        //lr_scheduler: lr::StepLR { start: 0.001, gamma: 0.1, step: 160 },
         save_rate: 80,
     };
 
@@ -213,7 +214,7 @@ fn main() {
     // loading directly from a `BulletFormat` file
     //let dataloader = loader::DirectSequentialDataLoader::new(&["data/baseline.data"]);
 
-    // trainer.load_from_checkpoint("checkpoints\\moarlayers-wdlskip2-240");
+    // trainer.load_from_checkpoint("checkpoints\\masternet-lower-lr-640");
 
     //trainer.save_to_checkpoint("checkpoints\\fixed-shit");
 
@@ -228,6 +229,6 @@ fn main() {
     ] {
         let eval = trainer.eval(fen);
         println!("FEN: {fen}");
-        println!("EVAL: {}", 362.0 * eval);
+        println!("EVAL: {}", 400.0 * eval);
     }
 }
