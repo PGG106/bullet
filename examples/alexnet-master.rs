@@ -19,7 +19,11 @@ use bullet_lib::{
 
 use bullet_lib::game::outputs::OutputBuckets;
 use bullet_lib::value::loader::SfBinpackLoader;
-use rand::{Rng, SeedableRng, distr::{Bernoulli, Distribution}, rngs::StdRng};
+use rand::{
+    Rng, SeedableRng,
+    distr::{Bernoulli, Distribution},
+    rngs::StdRng,
+};
 use sfbinpack::TrainingDataEntry;
 use sfbinpack::chess::r#move::MoveType;
 use sfbinpack::chess::piecetype::PieceType;
@@ -39,8 +43,8 @@ fn get_wdl(v: i16, pos: &sfbinpack::chess::position::Position) -> (f64, f64, f64
     let m = (pos.ply().min(240) as f64) / 64.0;
 
     // Coefficients from Stockfish WDL model
-    const AS: [f64; 4] = [-3.68389304,  30.07065921, -60.52878723, 149.53378557];
-    const BS: [f64; 4] = [-2.0181857,   15.85685038, -29.83452023,  47.59078827];
+    const AS: [f64; 4] = [-3.68389304, 30.07065921, -60.52878723, 149.53378557];
+    const BS: [f64; 4] = [-2.0181857, 15.85685038, -29.83452023, 47.59078827];
 
     let a = (((AS[0] * m + AS[1]) * m + AS[2]) * m) + AS[3];
     let mut b = (((BS[0] * m + BS[1]) * m + BS[2]) * m) + BS[3];
@@ -51,7 +55,7 @@ fn get_wdl(v: i16, pos: &sfbinpack::chess::position::Position) -> (f64, f64, f64
     let w = 1.0 / (1.0 + ((a - x) / b).exp());
     let l = 1.0 / (1.0 + ((a + x) / b).exp());
     let d = 1.0 - w - l;
-    
+
     (w, d, l)
 }
 
@@ -61,7 +65,7 @@ thread_local! {
 
 fn shouldkeep(result: i16, v: i16, pos: &sfbinpack::chess::position::Position) -> bool {
     let (w, d, l) = get_wdl(v, pos);
-    
+
     let keep_prob = if result > 0 {
         w
     } else if result < 0 {
@@ -69,7 +73,7 @@ fn shouldkeep(result: i16, v: i16, pos: &sfbinpack::chess::position::Position) -
     } else {
         d
     };
-    
+
     RNG.with(|rng| {
         let distrib = Bernoulli::new(keep_prob.clamp(0.0, 1.0)).unwrap();
         distrib.sample(&mut *rng.borrow_mut())
@@ -82,7 +86,8 @@ fn main() {
     const CLIP: f32 = 1.98;
     let l2 = 16;
     let l3 = 32;
-    let dataset_path = "data/master.binpack";
+    let name = "masternet";
+    let dataset_path = ["data/master.binpack"];
     let s1_initial_lr = 0.001;
     let s1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
     const STAGE1_SB: usize = 800;
@@ -143,18 +148,14 @@ fn main() {
             l3.forward(hl3).select(output_buckets)
         });
 
-    let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default()};
+    let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default() };
 
     trainer.optimiser.set_params_for_weight("l2w", no_clipping);
     trainer.optimiser.set_params_for_weight("l2b", no_clipping);
     trainer.optimiser.set_params_for_weight("l3w", no_clipping);
     trainer.optimiser.set_params_for_weight("l3b", no_clipping);
 
-    let wdl_scheduler = wdl::Sequence {
-        first: wdl::ConstantWDL { value: 0.0 },
-        second: wdl::ConstantWDL { value: 0.1 },
-        first_scheduler_final_superbatch: STAGE1_SB,
-    };
+    let wdl_scheduler = wdl::ConstantWDL { value: 0.0 };
 
     let lr_scheduler = lr::Warmup {
         inner: lr::CosineDecayLR { initial_lr: s1_initial_lr, final_lr: s1_final_lr, final_superbatch: STAGE1_SB },
@@ -162,7 +163,7 @@ fn main() {
     };
 
     let schedule = TrainingSchedule {
-        net_id: "masternet".to_string(),
+        net_id: (name.to_owned() + "-stage1").to_string(),
         eval_scale: 362.0,
         steps: TrainingSteps {
             batch_size: 16_384,
@@ -170,8 +171,8 @@ fn main() {
             start_superbatch: 1,
             end_superbatch: STAGE1_SB,
         },
-        wdl_scheduler,
-        lr_scheduler,
+        wdl_scheduler: wdl_scheduler.clone(), 
+        lr_scheduler: lr_scheduler.clone(),
         save_rate: 80,
     };
 
@@ -190,7 +191,7 @@ fn main() {
                 && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
                 && shouldkeep(entry.result, entry.score, &entry.pos)
         }
-        SfBinpackLoader::new(file_path, buffer_size_mb, threads, filter)
+        SfBinpackLoader::new_concat_multiple(&file_path, buffer_size_mb, threads, filter)
     };
 
     /*
@@ -213,9 +214,48 @@ fn main() {
     // loading directly from a `BulletFormat` file
     //let dataloader = loader::DirectSequentialDataLoader::new(&["data/baseline.data"]);
 
-    // trainer.load_from_checkpoint("checkpoints\\moarlayers-wdlskip2-240");
+    // trainer.load_from_checkpoint("checkpoints\\moarlayers-wdlskip2-800");
 
     //trainer.save_to_checkpoint("checkpoints\\fixed-shit");
+
+    trainer.run(&schedule, &settings, &dataloader);
+
+    // Stage 2
+
+    // same LR and WDL
+
+    // start at sb 700
+    let schedule = TrainingSchedule {
+        net_id: (name.to_owned() + "-stage2").to_string(),
+        eval_scale: 362.0,
+        steps: TrainingSteps {
+            batch_size: 16_384,
+            batches_per_superbatch: 6104,
+            start_superbatch: 700,
+            end_superbatch: STAGE1_SB,
+        },
+        wdl_scheduler,
+        lr_scheduler,
+        save_rate: 80,
+    };
+
+    // use different binpack set
+    let dataset_path = ["data/master.binpack", "data/t60-2020.binpack"];
+
+    let dataloader = {
+        let file_path = dataset_path;
+        let buffer_size_mb = 4096;
+        let threads = 4;
+        fn filter(entry: &TrainingDataEntry) -> bool {
+            entry.ply >= 20
+                && !entry.pos.is_checked(entry.pos.side_to_move())
+                && entry.score.unsigned_abs() <= 10000
+                && entry.mv.mtype() == MoveType::Normal
+                && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
+                && shouldkeep(entry.result, entry.score, &entry.pos)
+        }
+        SfBinpackLoader::new_concat_multiple(&file_path, buffer_size_mb, threads, filter)
+    };
 
     trainer.run(&schedule, &settings, &dataloader);
 
