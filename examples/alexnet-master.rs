@@ -22,7 +22,8 @@ use bullet_lib::value::loader::SfBinpackLoader;
 use rand::{
     Rng, SeedableRng,
     distr::{Bernoulli, Distribution},
-    rngs::StdRng, rng
+    rng,
+    rngs::StdRng,
 };
 use sfbinpack::TrainingDataEntry;
 use sfbinpack::chess::r#move::MoveType;
@@ -131,20 +132,9 @@ fn skip_piececount(pos: &sfbinpack::chess::position::Position) -> bool {
     rng.random_bool(piece_count_acceptance(pos))
 }
 
-fn main() {
-    // hyperparams to fiddle with
-    let hl_size = 1536;
-    const CLIP: f32 = 1.98;
-    let l2 = 16;
-    let l3 = 32;
-    let name = "foresight2";
-    let dataset_path = ["data/master.binpack"];
-    let s1_initial_lr = 0.001;
-    let s1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
-    const STAGE1_SB: usize = 800;
-    // currently does nothing
-    const NUM_OUTPUT_BUCKETS: usize = 8;
-    #[rustfmt::skip]
+// currently does nothing
+const NUM_OUTPUT_BUCKETS: usize = 8;
+#[rustfmt::skip]
     const BUCKET_LAYOUT: [usize; 32] = [
         0,  1,  2,  3,
         4,  5,  6,  7,
@@ -156,8 +146,19 @@ fn main() {
         14, 14, 15, 15
     ];
 
-    const NUM_INPUT_BUCKETS: usize = get_num_buckets(&BUCKET_LAYOUT);
+const NUM_INPUT_BUCKETS: usize = get_num_buckets(&BUCKET_LAYOUT);
 
+fn main() {
+    // hyperparams to fiddle with
+    const HL_SIZE: usize = 1536;
+    const CLIP: f32 = 1.98;
+    let l2 = 16;
+    let l3 = 32;
+    let name = "foresight2-l0reg";
+    let dataset_path = ["data/master.binpack"];
+    let s1_initial_lr = 0.001;
+    let s1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
+    const STAGE1_SB: usize = 800;
     let mut trainer = ValueTrainerBuilder::default()
         .dual_perspective()
         .optimiser(AdamW)
@@ -174,19 +175,18 @@ fn main() {
             SavedFormat::id("l3w"),
             SavedFormat::id("l3b"),
         ])
-        .loss_fn(|output, target| output.sigmoid().power_error(target, 2.5))
-         .build_custom(|builder, (stm_inputs, ntm_inputs, output_buckets), target| {
+        .build_custom(|builder, (stm_inputs, ntm_inputs, output_buckets), target| {
             // input layer factoriser
-            let l0f = builder.new_weights("l0f", Shape::new(hl_size, 768), InitSettings::Zeroed);
+            let l0f = builder.new_weights("l0f", Shape::new(HL_SIZE, 768), InitSettings::Zeroed);
             let expanded_factoriser = l0f.repeat(NUM_INPUT_BUCKETS);
 
             // input layer weights
-            let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, hl_size);
+            let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, HL_SIZE);
             l0.init_with_effective_input_size(32);
             l0.weights = (l0.weights + expanded_factoriser).clip_pass_through_grad(-CLIP, CLIP);
 
             // layerstack weights
-            let l1 = builder.new_affine("l1", hl_size, NUM_OUTPUT_BUCKETS * l2);
+            let l1 = builder.new_affine("l1", HL_SIZE, NUM_OUTPUT_BUCKETS * l2);
             let l2 = builder.new_affine("l2", l2, NUM_OUTPUT_BUCKETS * l3);
             let l3 = builder.new_affine("l3", l3, NUM_OUTPUT_BUCKETS);
 
@@ -194,13 +194,17 @@ fn main() {
             let stm_hidden = l0.forward(stm_inputs).crelu().pairwise_mul();
             let ntm_hidden = l0.forward(ntm_inputs).crelu().pairwise_mul();
             let l0_out = stm_hidden.concat(ntm_hidden);
-            let ones_l1_vec = builder.new_constant(Shape::new(1, L1), &[1.0 / L1 as f32; L1]);
+
+            let ones_l1_vec = builder.new_constant(Shape::new(1, HL_SIZE), &[1.0 / HL_SIZE as f32; HL_SIZE]);
             let l0_out_norm = ones_l1_vec.matmul(l0_out);
+
             let hl1 = l1.forward(l0_out).select(output_buckets);
             let hl2 = l1.forward(hl1).select(output_buckets).screlu();
             let hl3 = l2.forward(hl2).select(output_buckets).screlu();
             let l3_out = l3.forward(hl3).select(output_buckets);
+
             let loss = l3_out.sigmoid().squared_error(target);
+            let loss = loss + 0.005 * l0_out_norm;
             (l3_out, loss)
         });
 
@@ -227,7 +231,7 @@ fn main() {
             start_superbatch: 1,
             end_superbatch: STAGE1_SB,
         },
-        wdl_scheduler: wdl_scheduler.clone(), 
+        wdl_scheduler: wdl_scheduler.clone(),
         lr_scheduler: lr_scheduler.clone(),
         save_rate: 80,
     };
@@ -274,8 +278,7 @@ fn main() {
 
     //trainer.save_to_checkpoint("checkpoints\\fixed-shit");
 
-    trainer.load_from_checkpoint("checkpoints\\foresight2-stage1-560");
-
+    // trainer.load_from_checkpoint("checkpoints\\foresight2-stage1-560");
 
     trainer.run(&schedule, &settings, &dataloader);
 
