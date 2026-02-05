@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, mem::MaybeUninit};
 
 use bullet_lib::{
     game::{
@@ -22,11 +22,13 @@ use bullet_lib::value::loader::SfBinpackLoader;
 use rand::{
     Rng, SeedableRng,
     distr::{Bernoulli, Distribution},
-    rngs::StdRng,
+    rngs::StdRng, rng
 };
 use sfbinpack::TrainingDataEntry;
 use sfbinpack::chess::r#move::MoveType;
 use sfbinpack::chess::piecetype::PieceType;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy, Default)]
 pub struct CJBucket;
@@ -63,6 +65,13 @@ thread_local! {
     static RNG: RefCell<StdRng> = RefCell::new(StdRng::seed_from_u64(42));
 }
 
+fn do_skip(prob: f64) -> bool {
+    RNG.with(|rng| {
+        let distrib = Bernoulli::new(prob.clamp(0.0, 1.0)).unwrap();
+        distrib.sample(&mut *rng.borrow_mut())
+    })
+}
+
 fn shouldkeep(result: i16, v: i16, pos: &sfbinpack::chess::position::Position) -> bool {
     let (w, d, l) = get_wdl(v, pos);
 
@@ -80,13 +89,55 @@ fn shouldkeep(result: i16, v: i16, pos: &sfbinpack::chess::position::Position) -
     })
 }
 
+fn piece_count_acceptance(pos: &sfbinpack::chess::position::Position) -> f64 {
+    #[rustfmt::skip]
+    const DESIRED_DISTRIBUTION: [f64; 33] = [
+        0.018411966423, 0.020641545085, 0.022727271053,
+        0.024669162740, 0.026467201733, 0.028121406444,
+        0.029631758462, 0.030998276198, 0.032220941240,
+        0.033299772000, 0.034234750067, 0.035025893853,
+        0.035673184944, 0.036176641754, 0.036536245870,
+        0.036752015705, 0.036823932846, 0.036752015705,
+        0.036536245870, 0.036176641754, 0.035673184944,
+        0.035025893853, 0.034234750067, 0.033299772000,
+        0.032220941240, 0.030998276198, 0.029631758462,
+        0.028121406444, 0.026467201733, 0.024669162740,
+        0.022727271053, 0.020641545085, 0.018411966423,
+    ];
+
+    static PIECE_COUNT_STATS: [AtomicU64; 33] = {
+        let mut arr: [std::mem::MaybeUninit<AtomicU64>; 33] = [const { MaybeUninit::uninit() }; 33];
+        let mut i = 0;
+        while i < 33 {
+            arr[i].write(AtomicU64::new(0));
+            i += 1;
+        }
+        unsafe { std::mem::transmute::<_, [AtomicU64; 33]>(arr) }
+    };
+    static PIECE_COUNT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+    let pc = pos.occupied().count() as usize;
+    let count = PIECE_COUNT_STATS[pc].fetch_add(1, Ordering::Relaxed) + 1;
+    let total = PIECE_COUNT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    let frequency = count as f64 / total as f64;
+
+    // Calculate the acceptance probability for this piece count
+    let acceptance = 0.5 * DESIRED_DISTRIBUTION[pc] / frequency;
+    acceptance.clamp(0., 1.)
+}
+
+fn skip_piececount(pos: &sfbinpack::chess::position::Position) -> bool {
+    let mut rng = rng();
+    rng.random_bool(piece_count_acceptance(pos))
+}
+
 fn main() {
     // hyperparams to fiddle with
     let hl_size = 1536;
     const CLIP: f32 = 1.98;
     let l2 = 16;
     let l3 = 32;
-    let name = "masternet";
+    let name = "foresight2";
     let dataset_path = ["data/master.binpack"];
     let s1_initial_lr = 0.001;
     let s1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
@@ -124,7 +175,7 @@ fn main() {
             SavedFormat::id("l3b"),
         ])
         .loss_fn(|output, target| output.sigmoid().power_error(target, 2.5))
-        .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
+         .build_custom(|builder, (stm_inputs, ntm_inputs, output_buckets), target| {
             // input layer factoriser
             let l0f = builder.new_weights("l0f", Shape::new(hl_size, 768), InitSettings::Zeroed);
             let expanded_factoriser = l0f.repeat(NUM_INPUT_BUCKETS);
@@ -142,10 +193,15 @@ fn main() {
             // inference
             let stm_hidden = l0.forward(stm_inputs).crelu().pairwise_mul();
             let ntm_hidden = l0.forward(ntm_inputs).crelu().pairwise_mul();
-            let hl1 = stm_hidden.concat(ntm_hidden);
+            let l0_out = stm_hidden.concat(ntm_hidden);
+            let ones_l1_vec = builder.new_constant(Shape::new(1, L1), &[1.0 / L1 as f32; L1]);
+            let l0_out_norm = ones_l1_vec.matmul(l0_out);
+            let hl1 = l1.forward(l0_out).select(output_buckets);
             let hl2 = l1.forward(hl1).select(output_buckets).screlu();
             let hl3 = l2.forward(hl2).select(output_buckets).screlu();
-            l3.forward(hl3).select(output_buckets)
+            let l3_out = l3.forward(hl3).select(output_buckets);
+            let loss = l3_out.sigmoid().squared_error(target);
+            (l3_out, loss)
         });
 
     let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default() };
@@ -184,7 +240,7 @@ fn main() {
         let buffer_size_mb = 4096;
         let threads = 4;
         fn filter(entry: &TrainingDataEntry) -> bool {
-            entry.ply >= 20
+            entry.ply >= 28
                 && !entry.pos.is_checked(entry.pos.side_to_move())
                 && entry.score.unsigned_abs() <= 10000
                 && entry.mv.mtype() == MoveType::Normal
@@ -218,6 +274,9 @@ fn main() {
 
     //trainer.save_to_checkpoint("checkpoints\\fixed-shit");
 
+    trainer.load_from_checkpoint("checkpoints\\foresight2-stage1-560");
+
+
     trainer.run(&schedule, &settings, &dataloader);
 
     // Stage 2
@@ -247,7 +306,7 @@ fn main() {
         let buffer_size_mb = 4096;
         let threads = 4;
         fn filter(entry: &TrainingDataEntry) -> bool {
-            entry.ply >= 20
+            entry.ply >= 28
                 && !entry.pos.is_checked(entry.pos.side_to_move())
                 && entry.score.unsigned_abs() <= 10000
                 && entry.mv.mtype() == MoveType::Normal
