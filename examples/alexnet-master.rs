@@ -150,10 +150,10 @@ const NUM_INPUT_BUCKETS: usize = get_num_buckets(&BUCKET_LAYOUT);
 
 fn main() {
     // hyperparams to fiddle with
-    const HL_SIZE: usize = 1536;
+    const L1: usize = 1536;
     const CLIP: f32 = 1.98;
-    let l2 = 16;
-    let l3 = 32;
+    const L2: usize = 16;
+    const L3: usize = 32;
     let name = "foresight2-l0reg";
     let dataset_path = ["data/master.binpack"];
     let s1_initial_lr = 0.001;
@@ -176,37 +176,37 @@ fn main() {
             SavedFormat::id("l3b"),
         ])
         .build_custom(|builder, (stm_inputs, ntm_inputs, output_buckets), target| {
-            // input layer factoriser
-            let l0f = builder.new_weights("l0f", Shape::new(HL_SIZE, 768), InitSettings::Zeroed);
+            let l0f = builder.new_weights("l0f", Shape::new(L1, 768), InitSettings::Zeroed);
             let expanded_factoriser = l0f.repeat(NUM_INPUT_BUCKETS);
 
             // input layer weights
-            let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, HL_SIZE);
+            let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, L1);
             l0.init_with_effective_input_size(32);
             l0.weights = (l0.weights + expanded_factoriser).clip_pass_through_grad(-CLIP, CLIP);
 
-            // layerstack weights
-            let l1 = builder.new_affine("l1", HL_SIZE, NUM_OUTPUT_BUCKETS * l2);
-            let l2 = builder.new_affine("l2", l2, NUM_OUTPUT_BUCKETS * l3);
-            let l3 = builder.new_affine("l3", l3, NUM_OUTPUT_BUCKETS);
+            // output layer weights
+            let l1 = builder.new_affine("l1", L1, NUM_OUTPUT_BUCKETS * L2);
+            let l2 = builder.new_affine("l2", L2, NUM_OUTPUT_BUCKETS * L3);
+            let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
 
             // inference
             let stm_hidden = l0.forward(stm_inputs).crelu().pairwise_mul();
             let ntm_hidden = l0.forward(ntm_inputs).crelu().pairwise_mul();
-            let l0_out = stm_hidden.concat(ntm_hidden);
+            let hl1 = stm_hidden.concat(ntm_hidden);
 
-            let ones_l1_vec = builder.new_constant(Shape::new(1, HL_SIZE), &[1.0 / HL_SIZE as f32; HL_SIZE]);
-            let l0_out_norm = ones_l1_vec.matmul(l0_out);
+            let ones_l1_vec = builder.new_constant(Shape::new(1, L1), &[1.0 / L1 as f32; L1]);
+            let l0_out_norm = ones_l1_vec.matmul(hl1);
 
-            let hl1 = l1.forward(l0_out).select(output_buckets);
             let hl2 = l1.forward(hl1).select(output_buckets).screlu();
             let hl3 = l2.forward(hl2).select(output_buckets).screlu();
             let l3_out = l3.forward(hl3).select(output_buckets);
 
             let loss = l3_out.sigmoid().squared_error(target);
             let loss = loss + 0.005 * l0_out_norm;
-            (l3_out, loss)
+
+            return (l3_out, loss);
         });
+
 
     let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default() };
 
