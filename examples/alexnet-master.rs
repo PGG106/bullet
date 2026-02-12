@@ -154,7 +154,7 @@ fn main() {
     const CLIP: f32 = 1.98;
     const L2: usize = 16;
     const L3: usize = 32;
-    let name = "foresight2-l0reg";
+    let name = "piececount";
     let dataset_path = ["data/master.binpack"];
     let s1_initial_lr = 0.001;
     let s1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
@@ -186,7 +186,7 @@ fn main() {
 
             // output layer weights
             let l1 = builder.new_affine("l1", L1, NUM_OUTPUT_BUCKETS * L2);
-            let l2 = builder.new_affine("l2", L2, NUM_OUTPUT_BUCKETS * L3);
+            let l2 = builder.new_affine("l2", L2 * 2, NUM_OUTPUT_BUCKETS * L3);
             let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
 
             // inference
@@ -197,7 +197,9 @@ fn main() {
             let ones_l1_vec = builder.new_constant(Shape::new(1, L1), &[1.0 / L1 as f32; L1]);
             let l0_out_norm = ones_l1_vec.matmul(hl1);
 
-            let hl2 = l1.forward(hl1).select(output_buckets).screlu();
+            let l1_out = l1.forward(hl1).select(output_buckets);
+            let hl2 = l1_out.concat(l1_out.abs_pow(2.0)).crelu();
+
             let hl3 = l2.forward(hl2).select(output_buckets).screlu();
             let l3_out = l3.forward(hl3).select(output_buckets);
 
@@ -250,6 +252,7 @@ fn main() {
                 && entry.mv.mtype() == MoveType::Normal
                 && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
                 && shouldkeep(entry.result, entry.score, &entry.pos)
+                && skip_piececount(&entry.pos)
         }
         SfBinpackLoader::new_concat_multiple(&file_path, buffer_size_mb, threads, filter)
     };
@@ -280,7 +283,7 @@ fn main() {
 
     // trainer.load_from_checkpoint("checkpoints\\foresight2-stage1-560");
 
-    trainer.run(&schedule, &settings, &dataloader);
+    // trainer.run(&schedule, &settings, &dataloader);
 
     // Stage 2
 
@@ -315,6 +318,7 @@ fn main() {
                 && entry.mv.mtype() == MoveType::Normal
                 && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
                 && shouldkeep(entry.result, entry.score, &entry.pos)
+                && skip_piececount(&entry.pos)
         }
         SfBinpackLoader::new_concat_multiple(&file_path, buffer_size_mb, threads, filter)
     };
