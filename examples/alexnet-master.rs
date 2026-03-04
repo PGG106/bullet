@@ -66,7 +66,7 @@ thread_local! {
     static RNG: RefCell<StdRng> = RefCell::new(StdRng::seed_from_u64(42));
 }
 
-fn do_skip(prob: f64) -> bool {
+fn rng_keep(prob: f64) -> bool {
     RNG.with(|rng| {
         let distrib = Bernoulli::new(prob.clamp(0.0, 1.0)).unwrap();
         distrib.sample(&mut *rng.borrow_mut())
@@ -154,7 +154,7 @@ fn main() {
     const CLIP: f32 = 1.98;
     const L2: usize = 16;
     const L3: usize = 32;
-    let name = "piececount";
+    let name = "fixedwdl";
     let dataset_path = ["data/master.binpack"];
     let s1_initial_lr = 0.001;
     let s1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
@@ -217,7 +217,7 @@ fn main() {
     trainer.optimiser.set_params_for_weight("l3w", no_clipping);
     trainer.optimiser.set_params_for_weight("l3b", no_clipping);
 
-    let wdl_scheduler = wdl::ConstantWDL { value: 0.0 };
+    let wdl_scheduler = wdl::LinearWDL {start : 0.0,  end:0.15};
 
     let lr_scheduler = lr::Warmup {
         inner: lr::CosineDecayLR { initial_lr: s1_initial_lr, final_lr: s1_final_lr, final_superbatch: STAGE1_SB },
@@ -228,8 +228,8 @@ fn main() {
         net_id: (name.to_owned() + "-stage1").to_string(),
         eval_scale: 362.0,
         steps: TrainingSteps {
-            batch_size: 16_384,
-            batches_per_superbatch: 6104,
+            batch_size: 16_384 * 8 ,
+            batches_per_superbatch: 6104 / 8,
             start_superbatch: 1,
             end_superbatch: STAGE1_SB,
         },
@@ -281,13 +281,11 @@ fn main() {
 
     //trainer.save_to_checkpoint("checkpoints\\fixed-shit");
 
-    // trainer.load_from_checkpoint("checkpoints\\foresight2-stage1-560");
+    trainer.load_from_checkpoint("checkpoints\\wdlnet-stage1-800");
 
-    // trainer.run(&schedule, &settings, &dataloader);
+    trainer.run(&schedule, &settings, &dataloader);
 
     // Stage 2
-
-    // same LR and WDL
 
     // start at sb 700
     let schedule = TrainingSchedule {
@@ -296,7 +294,7 @@ fn main() {
         steps: TrainingSteps {
             batch_size: 16_384,
             batches_per_superbatch: 6104,
-            start_superbatch: 700,
+            start_superbatch: 1,
             end_superbatch: STAGE1_SB,
         },
         wdl_scheduler,
@@ -305,7 +303,7 @@ fn main() {
     };
 
     // use different binpack set
-    let dataset_path = ["data/master.binpack", "data/t60-2020.binpack"];
+    let dataset_path = ["data/master.binpack"];
 
     let dataloader = {
         let file_path = dataset_path;
@@ -323,7 +321,7 @@ fn main() {
         SfBinpackLoader::new_concat_multiple(&file_path, buffer_size_mb, threads, filter)
     };
 
-    trainer.run(&schedule, &settings, &dataloader);
+    // trainer.run(&schedule, &settings, &dataloader);
 
     for fen in [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
