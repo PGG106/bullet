@@ -327,7 +327,7 @@ fn main() {
             let hl3 = l2.forward(hl2).select(output_buckets).screlu();
             let l3_out = l3.forward(hl3).select(output_buckets);
 
-            let loss = l3_out.sigmoid().power_error(target, 2.5);
+            let loss = (l3_out.sigmoid() - target).abs_pow(2.5);
             let loss = loss + 0.004 * l0_out_norm;
 
             return (l3_out, loss);

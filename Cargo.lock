@@ -94,6 +94,7 @@ dependencies = [
  "bulletformat",
  "montyformat",
  "parking_lot",
+ "rand",
  "sfbinpack",
  "viriformat",
 ]
