@@ -28,6 +28,14 @@ name = "simple"
 path = "../../examples/simple.rs"
 
 [[example]]
+name = "alexnet"
+path = "../../examples/alexnet-master.rs"
+
+[[example]]
+name = "mnist"
+path = "../../examples/extra/mnist.rs"
+
+[[example]]
 name = "test1"
 path = "../../examples/tests/test1.rs"
 
