@@ -28,6 +28,10 @@ use rand::{
 use sfbinpack::TrainingDataEntry;
 use sfbinpack::chess::r#move::MoveType;
 use sfbinpack::chess::piecetype::PieceType;
+use sfbinpack::chess::position::Position;
+use sfbinpack::chess::r#move::Move;
+use sfbinpack::chess::bitboard::Bitboard;
+use sfbinpack::chess::attacks;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -132,6 +136,126 @@ fn skip_piececount(pos: &sfbinpack::chess::position::Position) -> bool {
     rng.random_bool(piece_count_acceptance(pos))
 }
 
+const SEE_PIECE_VALUES: [i32; 7] = [100, 300, 330, 500, 900, 20000, 0]; // P, N, B, R, Q, K, None
+
+pub fn estimated_see(pos: &Position, m: Move) -> i32 {
+    // initially take the value of the thing on the target square
+    let captured = pos.piece_at(m.to());
+    let mut value = if captured.piece_type() == PieceType::None {
+        0
+    } else {
+        SEE_PIECE_VALUES[captured.piece_type().ordinal() as usize]
+    };
+
+    if m.mtype() == MoveType::Promotion {
+        // if it's a promo, swap a pawn for the promoted piece type
+        let promo = m.promoted_piece().piece_type();
+        value += SEE_PIECE_VALUES[promo.ordinal() as usize] - SEE_PIECE_VALUES[0];
+    } else if m.mtype() == MoveType::EnPassant {
+        // for e.p. we will miss a pawn because the target square is empty
+        value = SEE_PIECE_VALUES[0];
+    }
+
+    value
+}
+
+pub fn static_exchange_eval(pos: &Position, m: Move, threshold: i32) -> bool {
+    let from = m.from();
+    let to = m.to();
+
+    let mut next_victim = if m.mtype() == MoveType::Promotion {
+        m.promoted_piece().piece_type()
+    } else {
+        pos.piece_at(from).piece_type()
+    };
+
+    let mut balance = estimated_see(pos, m) - threshold;
+
+    // if the best case fails, don't bother doing the full search.
+    if balance < 0 {
+        return false;
+    }
+
+    // worst case is losing the piece
+    balance -= SEE_PIECE_VALUES[next_victim.ordinal() as usize];
+
+    // if the worst case passes, we can return true immediately.
+    if balance >= 0 {
+        return true;
+    }
+
+    let mut occupied = pos.occupied();
+    occupied.set(from.index(), false);
+    occupied.set(to.index(), true);
+
+    if m.mtype() == MoveType::EnPassant {
+        occupied.set((to.index() ^ 8), false);
+    }
+
+    // after the move, it's the opponent's turn.
+    let mut colour = !pos.side_to_move();
+
+    let get_attackers = |sq, occ: Bitboard| {
+        (attacks::pawn(sfbinpack::chess::color::Color::White, sq) & pos.pieces_bb_color(sfbinpack::chess::color::Color::Black, PieceType::Pawn)
+            | attacks::pawn(sfbinpack::chess::color::Color::Black, sq) & pos.pieces_bb_color(sfbinpack::chess::color::Color::White, PieceType::Pawn)
+            | attacks::knight(sq) & pos.pieces_bb_type(PieceType::Knight)
+            | attacks::king(sq) & pos.pieces_bb_type(PieceType::King)
+            | attacks::bishop(sq, occ) & (pos.pieces_bb_type(PieceType::Bishop) | pos.pieces_bb_type(PieceType::Queen))
+            | attacks::rook(sq, occ) & (pos.pieces_bb_type(PieceType::Rook) | pos.pieces_bb_type(PieceType::Queen)))
+            & occ
+    };
+
+    let mut attackers = get_attackers(to, occupied);
+
+    loop {
+        let my_attackers = attackers & pos.pieces_bb(colour);
+        if my_attackers.bits() == 0 {
+            break;
+        }
+
+        // find cheapest attacker
+        for victim_idx in 0..6 {
+            let victim = PieceType::from_ordinal(victim_idx as u8);
+            if (my_attackers & pos.pieces_bb_type(victim)).bits() != 0 {
+                next_victim = victim;
+                break;
+            }
+        }
+
+        let lsb = (my_attackers & pos.pieces_bb_type(next_victim)).lsb();
+        occupied.set(lsb.index(), false);
+
+        // diagonal moves reveal bishops and queens:
+        if next_victim == PieceType::Pawn
+            || next_victim == PieceType::Bishop
+            || next_victim == PieceType::Queen
+        {
+            attackers |= attacks::bishop(to, occupied) & (pos.pieces_bb_type(PieceType::Bishop) | pos.pieces_bb_type(PieceType::Queen));
+        }
+
+        // orthogonal moves reveal rooks and queens:
+        if next_victim == PieceType::Rook || next_victim == PieceType::Queen {
+            attackers |= attacks::rook(to, occupied) & (pos.pieces_bb_type(PieceType::Rook) | pos.pieces_bb_type(PieceType::Queen));
+        }
+
+        attackers = attackers & occupied;
+
+        colour = !colour;
+
+        balance = -balance - 1 - SEE_PIECE_VALUES[next_victim.ordinal() as usize];
+
+        if balance >= 0 {
+            if next_victim == PieceType::King && (attackers & pos.pieces_bb(colour)).bits() != 0 {
+                colour = !colour;
+            }
+            break;
+        }
+    }
+
+    // the side that is to move after loop exit is the loser.
+    pos.side_to_move() != colour
+}
+
 // currently does nothing
 const NUM_OUTPUT_BUCKETS: usize = 8;
 #[rustfmt::skip]
@@ -221,7 +345,7 @@ fn main() {
 
     let lr_scheduler = lr::Warmup {
         inner: lr::CosineDecayLR { initial_lr: s1_initial_lr, final_lr: s1_final_lr, final_superbatch: STAGE1_SB },
-        warmup_batches: 800,
+        warmup_batches: 200,
     };
 
     let schedule = TrainingSchedule {
@@ -248,8 +372,8 @@ fn main() {
         fn filter(entry: &TrainingDataEntry) -> bool {
             entry.ply >= 28
                 && !entry.pos.is_checked(entry.pos.side_to_move())
-                && entry.score.unsigned_abs() <= 10000
-                && entry.mv.mtype() == MoveType::Normal
+                && entry.score.unsigned_abs() <= 20000
+                && (entry.mv.mtype() == MoveType::Normal)
                 && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
                 && shouldkeep(entry.result, entry.score, &entry.pos)
                 && skip_piececount(&entry.pos)
@@ -257,45 +381,31 @@ fn main() {
         SfBinpackLoader::new_concat_multiple(&file_path, buffer_size_mb, threads, filter)
     };
 
-    /*
-        let dataloader = {
-          let file_path = "data/monty.binpack";
-          let buffer_size_mb = 4096;
-          let threads = 6;
-          fn filter(pos: &Position, best_move: Move, score: i16, _result: f32) -> bool {
-              pos.fullm() >= 8
-                  && score.unsigned_abs() <= 10000
-                  && !best_move.is_capture()
-                  && !best_move.is_promo()
-                  && !pos.in_check()
-          }
-
-          loader::MontyBinpackLoader::new(file_path, buffer_size_mb, threads, filter)
-      };
-    */
-
-    // loading directly from a `BulletFormat` file
-    //let dataloader = loader::DirectSequentialDataLoader::new(&["data/baseline.data"]);
-
-    // trainer.load_from_checkpoint("checkpoints\\moarlayers-wdlskip2-800");
+    trainer.load_from_checkpoint("checkpoints\\fixedwdl-stage1-800");
 
     //trainer.save_to_checkpoint("checkpoints\\fixed-shit");
 
-    trainer.load_from_checkpoint("checkpoints\\wdlnet-stage1-800");
 
     trainer.run(&schedule, &settings, &dataloader);
 
     // Stage 2
+
+    let wdl_scheduler = wdl::ConstantWDL {value:0.15};
+
+    let lr_scheduler = lr::Warmup {
+        inner: lr::CosineDecayLR { initial_lr: s1_initial_lr * 0.1, final_lr: s1_final_lr * 0.25, final_superbatch: 1000},
+        warmup_batches: 10,
+    };
 
     // start at sb 700
     let schedule = TrainingSchedule {
         net_id: (name.to_owned() + "-stage2").to_string(),
         eval_scale: 362.0,
         steps: TrainingSteps {
-            batch_size: 16_384,
-            batches_per_superbatch: 6104,
-            start_superbatch: 1,
-            end_superbatch: STAGE1_SB,
+            batch_size: 16_384 * 8 ,
+            batches_per_superbatch: 6104 / 8,
+            start_superbatch: 801,
+            end_superbatch: 1000,
         },
         wdl_scheduler,
         lr_scheduler,
@@ -303,7 +413,8 @@ fn main() {
     };
 
     // use different binpack set
-    let dataset_path = ["data/master.binpack"];
+    let dataset_path = [
+    "data/test78-junjulaug2022-16tb7p-eval-filt-v2-d6.binpack"];
 
     let dataloader = {
         let file_path = dataset_path;
@@ -312,16 +423,16 @@ fn main() {
         fn filter(entry: &TrainingDataEntry) -> bool {
             entry.ply >= 28
                 && !entry.pos.is_checked(entry.pos.side_to_move())
-                && entry.score.unsigned_abs() <= 10000
+                && entry.score.unsigned_abs() <= 20000
                 && entry.mv.mtype() == MoveType::Normal
-                && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
+                && (entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None)
                 && shouldkeep(entry.result, entry.score, &entry.pos)
                 && skip_piececount(&entry.pos)
         }
         SfBinpackLoader::new_concat_multiple(&file_path, buffer_size_mb, threads, filter)
     };
 
-    // trainer.run(&schedule, &settings, &dataloader);
+    trainer.run(&schedule, &settings, &dataloader);
 
     for fen in [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
