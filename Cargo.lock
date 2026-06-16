@@ -106,6 +106,8 @@ dependencies = [
  "bullet-trainer",
  "bulletformat",
  "montyformat",
+ "parking_lot",
+ "rand",
  "sfbinpack",
  "viriformat",
 ]
