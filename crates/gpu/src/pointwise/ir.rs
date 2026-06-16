@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
     fmt::{self, Write},
-    rc::Rc,
 };
 
 use bullet_compiler::{
@@ -18,7 +17,7 @@ use crate::{
         operations::{MemIO, PType, PointwiseOp},
         write::{code_str, tystr},
     },
-    runtime::Dim3,
+    runtime::{DeviceProps, Dialect, Dim3},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -33,7 +32,6 @@ pub struct PointwiseIR {
     ir: IR<Pointwise>,
     size: Size,
     tid: NodeId,
-    var: NodeId,
     bufs: Vec<NodeId>,
     read_from: BTreeSet<NodeId>,
     written_to: BTreeSet<NodeId>,
@@ -44,18 +42,13 @@ impl PointwiseIR {
     pub fn new(size: Size) -> Result<Self, IRError> {
         let mut ir = IR::default();
 
-        let [var] = ir.add_op([], PointwiseOp::VarSize)?[..] else {
-            return Err("Invalid number outputs!".into());
-        };
-
-        let [tid] = ir.add_op([var], PointwiseOp::ThreadId)?[..] else {
+        let [tid] = ir.add_op([], PointwiseOp::ThreadId)?[..] else {
             return Err("Invalid number outputs!".into());
         };
 
         Ok(Self {
             ir,
             tid,
-            var,
             size,
             bufs: Vec::new(),
             read_from: BTreeSet::new(),
@@ -66,14 +59,6 @@ impl PointwiseIR {
 
     pub fn tid(&self) -> NodeId {
         self.tid
-    }
-
-    pub fn var(&self) -> NodeId {
-        self.var
-    }
-
-    pub fn eval_size(&mut self, size: Size) -> NodeId {
-        self.ir.add_op([self.var], PointwiseOp::EvalSize(size)).unwrap()[0]
     }
 
     pub fn add_buf(&mut self, ty: TType) -> NodeId {
@@ -265,7 +250,15 @@ impl PointwiseIR {
             return Err("Only integer pointer allowed!".into());
         };
 
-        let op = PointwiseOp::SpMM { nnz: matmul.nnz(), rows: matmul.rows(), cols: matmul.cols(), ty, p2size };
+        let op = PointwiseOp::SpMM {
+            nnz: matmul.nnz().get(),
+            rows: matmul.rows().get(),
+            cols: matmul.cols().get(),
+            stride: matmul.stride().get(),
+            offset: matmul.offset(),
+            ty,
+            p2size,
+        };
 
         self.read_from.insert(weights);
         self.read_from.insert(indices);
@@ -287,7 +280,14 @@ impl PointwiseIR {
             return Err("Only integer pointer allowed!".into());
         };
 
-        let op = PointwiseOp::SpMMT { nnz: matmul.nnz(), rows: matmul.rows(), cols: matmul.cols(), ty };
+        let op = PointwiseOp::SpMMT {
+            nnz: matmul.nnz().get(),
+            rows: matmul.rows().get(),
+            cols: matmul.cols().get(),
+            stride: matmul.stride().get(),
+            offset: matmul.offset(),
+            ty,
+        };
 
         self.needs_zero.insert(weights);
         self.read_from.insert(indices);
@@ -320,16 +320,15 @@ impl PointwiseIR {
         Ok(false)
     }
 
-    pub fn source_code(&self, kernel_name: &str) -> Result<String, fmt::Error> {
+    pub fn source_code(&self, kernel_name: &str, props: &DeviceProps) -> Result<String, fmt::Error> {
         let name = |id: NodeId| format!("n{}", id.inner());
         let mut code = String::new();
 
         for op_id in self.ir.topo_order_ops().unwrap() {
             let op = self.ir.op(op_id).unwrap();
 
-            if let PointwiseOp::VarSize | PointwiseOp::Buffer { .. } = op.data() {
-            } else {
-                let mut src = code_str(*op.data(), self.size).unwrap();
+            if !matches!(op.data(), PointwiseOp::Buffer { .. }) {
+                let mut src = code_str(*op.data(), self.size, props).unwrap();
 
                 for (i, &id) in op.inputs().iter().enumerate() {
                     src = src.replace(&format!("IN{}", i + 1), &name(id));
@@ -347,17 +346,32 @@ impl PointwiseIR {
 
         let mut src = String::new();
 
-        write!(&mut src, "extern \"C\" __global__ void {kernel_name}(")?;
+        match props.dialect() {
+            Dialect::CudaHip => {
+                write!(&mut src, "extern \"C\" __global__ void {kernel_name}(")?;
 
-        let varp = self.size.var_power();
-        if varp > 0 {
-            write!(&mut src, "const int {}", name(self.var))?;
-        }
+                for (i, &input) in self.bufs.iter().enumerate() {
+                    let comma = if i > 0 { ", " } else { "" };
+                    let PType::Pointer(ty) = self.ir.node(input).unwrap().ty() else { panic!() };
+                    write!(&mut src, "{comma}{}* {}", tystr(ty), name(input))?;
+                }
+            }
+            Dialect::Msl => {
+                writeln!(&mut src, "#include <metal_stdlib>")?;
+                writeln!(&mut src, "using namespace metal;")?;
+                writeln!(&mut src)?;
 
-        for (i, &input) in self.bufs.iter().enumerate() {
-            let comma = if i > 0 || varp > 0 { ", " } else { "" };
-            let PType::Pointer(ty) = self.ir.node(input).unwrap().ty() else { panic!() };
-            write!(&mut src, "{comma}{}* {}", tystr(ty), name(input))?;
+                write!(&mut src, "kernel void {kernel_name}(")?;
+
+                for (i, &input) in self.bufs.iter().enumerate() {
+                    let comma = if i > 0 { ", " } else { "" };
+                    let PType::Pointer(ty) = self.ir.node(input).unwrap().ty() else { panic!() };
+                    write!(&mut src, "{comma}device {}* {} [[buffer({i})]]", tystr(ty), name(input))?;
+                }
+
+                let comma = if !self.bufs.is_empty() { ", " } else { "" };
+                write!(&mut src, "{comma}uint metal_tid [[thread_position_in_grid]]")?;
+            }
         }
 
         writeln!(&mut src, ") {{")?;
@@ -396,10 +410,8 @@ impl PointwiseIR {
                 | P::ThreadId
                 | P::Constant { .. }
                 | P::Buffer { .. }
-                | P::VarSize
                 | P::Div
                 | P::Rem
-                | P::EvalSize(_)
                 | P::Broadcast(_, _) => {}
             }
         }
@@ -410,7 +422,7 @@ impl PointwiseIR {
     /// ### Safety
     ///
     /// User must ensure same invariants as KernelSrc hold
-    pub unsafe fn lower(&self, name: String) -> Result<KernelSrc, IRError> {
+    pub unsafe fn lower(&self, name: String, props: &DeviceProps) -> Result<KernelSrc, IRError> {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         let mut arg_order = Vec::new();
@@ -438,8 +450,8 @@ impl PointwiseIR {
             }
         }
 
-        let source = self.source_code(&name).map_err(|e| IRError::from(format!("{e:?}")))?;
-        let total = self.size;
+        let source = self.source_code(&name, props).map_err(|e| IRError::from(format!("{e:?}")))?;
+        let total = self.size.get();
 
         unsafe {
             Ok(KernelSrc::new(
@@ -447,18 +459,17 @@ impl PointwiseIR {
                 outputs,
                 name,
                 source,
-                self.size.var_power() > 0,
                 arg_order,
                 requires_zero,
-                Rc::new(move |s| Dim3 { x: total.evaluate(s).div_ceil(256) as u32, y: 1, z: 1 }),
-                Rc::new(|_| 256),
-                Rc::new(|_| 0),
+                Dim3 { x: total.div_ceil(256).try_into().unwrap(), y: 1, z: 1 },
+                256,
+                0,
             ))
         }
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
 #[cfg(test)]
 mod tests {
     use bullet_compiler::tensor::TValue;
@@ -471,9 +482,9 @@ mod tests {
     use super::*;
 
     fn fmadd<G: Gpu>() -> Result<(), G::Error> {
-        let ty = TType::new(Size::variable(), DType::F32);
+        let ty = TType::new(4, DType::F32);
 
-        let mut ir = PointwiseIR::new(Size::variable()).unwrap();
+        let mut ir = PointwiseIR::new(4.into()).unwrap();
         let input1 = ir.add_buf(ty);
         let input2 = ir.add_buf(ty);
 
@@ -488,7 +499,7 @@ mod tests {
         ir.write(input2, tid, value4).unwrap();
 
         let device = Device::<G>::new(0)?;
-        let kernel = unsafe { ir.lower("fmadd".to_string()).unwrap() }.compile(device.clone())?;
+        let kernel = unsafe { ir.lower("fmadd".to_string(), device.props()).unwrap() }.compile(device.clone())?;
         let stream = device.new_stream()?;
 
         let values1 = TValue::F32(vec![1.0, 2.0, 3.0, 4.0]);
@@ -523,6 +534,16 @@ mod tests {
         #[test]
         fn fmadd() -> Result<(), ROCmError> {
             super::fmadd::<ROCm>()
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    mod metal {
+        use crate::runtime::metal::{Metal, MetalError};
+
+        #[test]
+        fn fmadd() -> Result<(), MetalError> {
+            super::fmadd::<Metal>()
         }
     }
 }

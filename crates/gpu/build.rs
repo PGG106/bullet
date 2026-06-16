@@ -19,6 +19,12 @@ fn get_var_path(name: &str) -> PathBuf {
 }
 
 fn main() {
+    // WSL special case puts e.g. libcuda in this directory to interface
+    // with the actual windows driver
+    if PathBuf::from("/usr/lib/wsl/lib/").exists() {
+        println!("cargo:rustc-link-search=native=/usr/lib/wsl/lib/");
+    }
+
     if cfg!(feature = "cuda") {
         let cuda_path = get_var_path("CUDA_PATH");
 
@@ -32,6 +38,12 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cudart");
         println!("cargo:rustc-link-lib=dylib=nvrtc");
         println!("cargo:rustc-link-lib=dylib=cublas");
+    }
+
+    if cfg!(feature = "metal") {
+        // Metal framework linking is handled by the `metal` crate dependency.
+        // MetalPerformanceShaders is linked here for BLAS (GEMM) operations.
+        println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
     }
 
     if cfg!(feature = "rocm") {

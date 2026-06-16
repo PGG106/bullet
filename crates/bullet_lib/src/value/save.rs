@@ -3,22 +3,16 @@ use std::{
     io::{self, Write},
 };
 
-use crate::{nn::ExecutionContext, value::ValueTrainerState};
+use crate::nn::ExecutionContext;
 use bullet_compiler::tensor::TValue;
 use bullet_trainer::{
-    Trainer,
-    model::save::{ModelWeights, QuantTarget},
-    optimiser::OptimiserState,
+    model::{QuantTarget, SavedFormat},
+    optimiser::{Optimiser, OptimiserState},
 };
 
-use crate::{
-    game::{inputs::SparseInputType, outputs::OutputBuckets},
-    value::{ValueTrainer, loader::LoadableDataType},
-};
+use crate::{game::inputs::SparseInputType, value::ValueTrainer};
 
-type ValueTrainerInner<Opt, Inp, Out> = Trainer<ExecutionContext, Opt, ValueTrainerState<Inp, Out>>;
-
-pub(super) fn write_losses(path: &str, error_record: &[(usize, usize, f32)]) {
+pub fn write_losses(path: &str, error_record: &[(usize, usize, f32)]) {
     use std::io::Write;
 
     let mut writer = std::io::BufWriter::new(std::fs::File::create(path).expect("Opening log file failed!"));
@@ -27,44 +21,43 @@ pub(super) fn write_losses(path: &str, error_record: &[(usize, usize, f32)]) {
     }
 }
 
-pub(super) fn save_to_checkpoint<Opt, Inp, Out>(trainer: &ValueTrainerInner<Opt, Inp, Out>, path: &str)
+pub fn save_to_checkpoint<O>(optimiser: &Optimiser<ExecutionContext, O>, saved_format: &[SavedFormat], path: &str)
 where
-    Opt: OptimiserState<ExecutionContext>,
-    Inp: SparseInputType,
-    Inp::RequiredDataType: LoadableDataType,
-    Out: OutputBuckets<Inp::RequiredDataType>,
+    O: OptimiserState<ExecutionContext>,
 {
     std::fs::create_dir(path).unwrap_or(());
 
     let optimiser_path = format!("{path}/optimiser_state");
     std::fs::create_dir(optimiser_path.as_str()).unwrap_or(());
-    trainer.optimiser.write_to_checkpoint(&optimiser_path).unwrap();
+    optimiser.write_to_checkpoint(&optimiser_path).unwrap();
 
-    if let Err(e) = save_unquantised(trainer, &format!("{path}/raw.bin")) {
+    if let Err(e) = save_unquantised(optimiser, saved_format, &format!("{path}/raw.bin")) {
         println!("Failed to write raw network weights:");
         println!("{e}");
     }
 
-    if let Err(e) = save_quantised(trainer, &format!("{path}/quantised.bin")) {
+    if let Err(e) = save_quantised(optimiser, saved_format, &format!("{path}/quantised.bin")) {
         println!("Failed to write quantised network weights:");
         println!("{e}");
     }
 }
 
-pub(super) fn save_unquantised<Opt, Inp, Out>(trainer: &ValueTrainerInner<Opt, Inp, Out>, path: &str) -> io::Result<()>
+pub fn save_unquantised<O>(
+    optimiser: &Optimiser<ExecutionContext, O>,
+    saved_format: &[SavedFormat],
+    path: &str,
+) -> io::Result<()>
 where
-    Opt: OptimiserState<ExecutionContext>,
-    Inp: SparseInputType,
-    Inp::RequiredDataType: LoadableDataType,
-    Out: OutputBuckets<Inp::RequiredDataType>,
+    O: OptimiserState<ExecutionContext>,
 {
     let mut file = File::create(path).unwrap();
 
     let mut buf = Vec::new();
 
-    for fmt in &trainer.state.saved_format {
+    for fmt in saved_format {
         if let Some(id) = &fmt.get_id() {
-            let Some(TValue::F32(weights)) = trainer.optimiser.model.get_weights(id) else { panic!() };
+            let weights = optimiser.weights().get(id).unwrap();
+            let TValue::F32(weights) = weights.to_host().unwrap() else { panic!() };
             let quantised = QuantTarget::Float.quantise(false, &weights)?;
             buf.extend_from_slice(&quantised);
         }
@@ -75,31 +68,18 @@ where
     Ok(())
 }
 
-pub(super) fn save_quantised<Opt, Inp, Out>(trainer: &ValueTrainerInner<Opt, Inp, Out>, path: &str) -> io::Result<()>
+pub fn save_quantised<O>(
+    optimiser: &Optimiser<ExecutionContext, O>,
+    saved_format: &[SavedFormat],
+    path: &str,
+) -> io::Result<()>
 where
-    Opt: OptimiserState<ExecutionContext>,
-    Inp: SparseInputType,
-    Inp::RequiredDataType: LoadableDataType,
-    Out: OutputBuckets<Inp::RequiredDataType>,
+    O: OptimiserState<ExecutionContext>,
 {
-    let weight_store = ModelWeights::from(&trainer.optimiser.model);
+    let weight_store = &*optimiser.cpu_weights().unwrap();
 
     let mut file = File::create(path).unwrap();
-    let mut buf = Vec::new();
-
-    for fmt in &trainer.state.saved_format {
-        buf.extend_from_slice(&fmt.write_to_byte_buffer(&weight_store)?);
-    }
-
-    let bytes = buf.len() % 64;
-    if bytes > 0 {
-        let chs = [b'b', b'u', b'l', b'l', b'e', b't'];
-
-        for i in 0..64 - bytes {
-            buf.push(chs[i % chs.len()]);
-        }
-    }
-
+    let buf = weight_store.to_quantised_buffer(saved_format, true)?;
     file.write_all(&buf)?;
 
     Ok(())
@@ -109,8 +89,6 @@ impl<Opt, Inp, Out> ValueTrainer<Opt, Inp, Out>
 where
     Opt: OptimiserState<ExecutionContext>,
     Inp: SparseInputType,
-    Inp::RequiredDataType: LoadableDataType,
-    Out: OutputBuckets<Inp::RequiredDataType>,
 {
     pub fn load_from_checkpoint(&mut self, path: &str) {
         let err = self.optimiser.load_from_checkpoint(&format!("{path}/optimiser_state"));
@@ -123,14 +101,14 @@ where
     }
 
     pub fn save_to_checkpoint(&self, path: &str) {
-        save_to_checkpoint(&self.0, path);
+        save_to_checkpoint(&self.optimiser, &self.state.saved_format, path);
     }
 
     pub fn save_quantised(&self, path: &str) -> io::Result<()> {
-        save_quantised(self, path)
+        save_quantised(&self.optimiser, &self.state.saved_format, path)
     }
 
     pub fn save_unquantised(&self, path: &str) -> io::Result<()> {
-        save_unquantised(self, path)
+        save_unquantised(&self.optimiser, &self.state.saved_format, path)
     }
 }

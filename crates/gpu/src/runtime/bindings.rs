@@ -1,8 +1,9 @@
 use std::{
     ffi::{CStr, c_char, c_int, c_uint, c_void},
     fmt,
-    hash::Hash,
 };
+
+use crate::runtime::Dialect;
 
 /// Kernel grid or block dimensions
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -23,13 +24,14 @@ pub struct GemmConfig {
     pub beta: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceProps {
     pub(super) name: String,
     pub(super) warp_size: Option<u8>,
     pub(super) stream_mem_alloc: bool,
     pub(super) vec_atomics: bool,
     pub(super) arch: Option<String>,
+    pub(super) dialect: Dialect,
 }
 
 impl DeviceProps {
@@ -52,6 +54,10 @@ impl DeviceProps {
     pub fn arch(&self) -> Option<&str> {
         self.arch.as_deref()
     }
+
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
+    }
 }
 
 /// This is a private trait, so nobody outside the crate can access these methods
@@ -60,7 +66,7 @@ impl DeviceProps {
 pub trait GpuBindings: 'static {
     type Err: fmt::Debug + Eq + From<String>;
     type Dev: Copy;
-    type Ptr: Copy + Default + Eq + Hash + Ord;
+    type Ptr: Copy + Default + Eq + Ord;
     type Ctx: Copy;
     type Stream: Copy;
     type BlasHandle: Copy;
@@ -120,12 +126,14 @@ pub trait GpuBindings: 'static {
 
     unsafe fn kernel_load(func: Self::Kernel) -> Result<(), Self::Err>;
 
+    unsafe fn kernel_destroy(kernel: Self::Kernel) -> Result<(), Self::Err>;
+
     unsafe fn kernel_launch(
         func: Self::Kernel,
         stream: Self::Stream,
         grid_dim: Dim3,
         block_dim: Dim3,
-        args: *mut *mut c_void,
+        args: &mut [*mut c_void],
         smem: c_uint,
     ) -> Result<(), Self::Err>;
 

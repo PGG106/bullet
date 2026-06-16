@@ -1,13 +1,19 @@
 use std::{fs::File, sync::mpsc, thread};
 
-use sfbinpack::{
-    CompressedTrainingDataEntryReader, TrainingDataEntry,
-    chess::{color::Color, piecetype::PieceType},
+use bullet_trainer::reader::DataReader;
+use sfbinpack::CompressedTrainingDataEntryReader;
+pub use sfbinpack::{
+    TrainingDataEntry,
+    chess::{
+        color::Color,
+        r#move::{Move, MoveType},
+        piecetype::PieceType,
+    },
 };
 
 use crate::game::formats::bulletformat::ChessBoard;
 
-use super::{DataLoader, rng::SimpleRand};
+use super::rng::SimpleRand;
 
 fn convert_to_bulletformat(entry: &TrainingDataEntry) -> ChessBoard {
     let mut bbs = [0; 8];
@@ -59,26 +65,18 @@ impl<T: Fn(&TrainingDataEntry) -> bool> SfBinpackLoader<T> {
     }
 }
 
-impl<T> DataLoader<ChessBoard> for SfBinpackLoader<T>
+impl<T> DataReader<ChessBoard> for SfBinpackLoader<T>
 where
     T: Fn(&TrainingDataEntry) -> bool + Clone + Send + Sync + 'static,
 {
-    fn data_file_paths(&self) -> &[String] {
-        &self.file_paths
-    }
-
-    fn count_positions(&self) -> Option<u64> {
-        None
-    }
-
-    fn map_chunks<F: FnMut(&[ChessBoard]) -> bool>(&self, _: usize, mut f: F) {
+    fn read_chunks<F: FnMut(&[ChessBoard]) -> bool>(&self, _: usize, mut f: F) {
         let file_paths = self.file_paths.clone();
         let buffer_size = self.buffer_size;
         let threads = self.threads;
         let filter = self.filter.clone();
 
         let reader_buffer_size = 16384 * threads;
-        let (reader_sender, reader_receiver) = mpsc::sync_channel::<Vec<TrainingDataEntry>>(8);
+        let (reader_sender, reader_receiver) = mpsc::sync_channel::<Vec<TrainingDataEntry>>(4);
         let (reader_msg_sender, reader_msg_receiver) = mpsc::sync_channel::<bool>(1);
 
         std::thread::spawn(move || {

@@ -2,7 +2,10 @@
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 
-use crate::runtime::bindings::{DeviceProps, GemmConfig};
+use crate::runtime::{
+    Dialect,
+    bindings::{DeviceProps, GemmConfig},
+};
 
 use super::bindings::{Dim3, GpuBindings};
 
@@ -58,6 +61,7 @@ impl GpuBindings for ROCm {
             stream_mem_alloc: false,
             vec_atomics: false,
             arch: None,
+            dialect: Dialect::CudaHip,
         })
     }
 
@@ -139,12 +143,16 @@ impl GpuBindings for ROCm {
         Ok(())
     }
 
+    unsafe fn kernel_destroy(_kernel: hipFunction) -> ROCmResult {
+        Ok(())
+    }
+
     unsafe fn kernel_launch(
         func: hipFunction,
         stream: hipStream,
         gdim: Dim3,
         bdim: Dim3,
-        args: *mut *mut c_void,
+        args: &mut [*mut c_void],
         smem: c_uint,
     ) -> ROCmResult {
         error::runtime(hipModuleLaunchKernel(
@@ -157,7 +165,7 @@ impl GpuBindings for ROCm {
             bdim.z,
             smem as c_uint,
             stream,
-            args,
+            args.as_mut_ptr(),
             std::ptr::null_mut(),
         ))
     }
@@ -194,15 +202,19 @@ impl GpuBindings for ROCm {
         ))?;
         error::nvrtc(hiprtcCompileProgram(prog, num_options, options))?;
 
-        let mut size = 0usize;
-        error::nvrtc(hiprtcGetCodeSize(prog, &mut size))?;
+        let code = (|| {
+            let mut size = 0usize;
+            error::nvrtc(hiprtcGetCodeSize(prog, &mut size))?;
 
-        let mut ptx = vec![0; size];
-        error::nvrtc(hiprtcGetCode(prog, ptx.as_mut_ptr()))?;
+            let mut ptx = vec![0; size];
+            error::nvrtc(hiprtcGetCode(prog, ptx.as_mut_ptr()))?;
+
+            Ok(ptx)
+        })();
 
         error::nvrtc(hiprtcDestroyProgram(&mut prog))?;
 
-        Ok(ptx)
+        code
     }
 
     unsafe fn blas_create() -> Result<hipblasHandle, ROCmError> {

@@ -6,7 +6,7 @@ mod topo;
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Values},
-    fmt,
+    error, fmt,
 };
 
 pub use node::{Node, NodeId};
@@ -26,8 +26,22 @@ pub trait TypeSystem: Copy + fmt::Debug {
 }
 
 /// Simple string error type tied to the IR
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IRError(String);
+
+impl fmt::Debug for IRError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "IRError: {}", self.0)
+    }
+}
+
+impl fmt::Display for IRError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl error::Error for IRError {}
 
 impl<T: Into<String>> From<T> for IRError {
     fn from(value: T) -> Self {
@@ -94,6 +108,11 @@ impl<T: TypeSystem> IR<T> {
             .collect::<Result<_, _>>()?;
 
         topo::topo_order(edges_rev).ok_or("Cycle found!".into()).map(|x| x.into_iter().map(OpId::from_inner).collect())
+    }
+
+    pub fn ordered_operations(&self) -> Result<Vec<Op<T>>, IRError> {
+        let ids = self.topo_order_ops()?;
+        ids.into_iter().map(|id| self.op(id).cloned()).collect()
     }
 
     /// Returns an error if any graph invariants are broken, otherwise returns `Ok(())`
@@ -258,30 +277,46 @@ impl<T: TypeSystem> IR<T> {
 
     /// Finds all operations that are required to complete before this one can be performed
     pub fn get_dependent_ops_set(&self, id: OpId) -> Result<BTreeSet<OpId>, IRError> {
-        let mut set: BTreeSet<_> = [id].into();
+        let mut set = BTreeSet::new();
+        self.get_dependent_ops_set_inner(id, &mut set, &mut BTreeSet::default())?;
+        Ok(set)
+    }
 
-        for parent in self.op(id)?.inputs() {
-            let parent_op = self.parent_op(*parent)?;
+    fn get_dependent_ops_set_inner(
+        &self,
+        id: OpId,
+        set: &mut BTreeSet<OpId>,
+        visited: &mut BTreeSet<OpId>,
+    ) -> Result<(), IRError> {
+        if visited.insert(id) {
+            set.insert(id);
 
-            for op in self.get_dependent_ops_set(parent_op)? {
-                set.insert(op);
+            for parent in self.op(id)?.inputs() {
+                let parent_op = self.parent_op(*parent)?;
+                self.get_dependent_ops_set_inner(parent_op, set, visited)?;
             }
         }
 
-        Ok(set)
+        Ok(())
     }
 
     /// Equivalent to `self.get_dependent_ops_set(id)?.contains(&target)` but faster
     pub fn is_dependent_op(&self, id: OpId, target: OpId) -> Result<bool, IRError> {
+        self.is_dependent_op_inner(id, target, &mut BTreeSet::new())
+    }
+
+    fn is_dependent_op_inner(&self, id: OpId, target: OpId, visited: &mut BTreeSet<OpId>) -> Result<bool, IRError> {
         if id == target {
             return Ok(true);
         }
 
-        for parent in self.op(id)?.inputs() {
-            let parent_op = self.parent_op(*parent)?;
+        if visited.insert(id) {
+            for parent in self.op(id)?.inputs() {
+                let parent_op = self.parent_op(*parent)?;
 
-            if self.is_dependent_op(parent_op, target)? {
-                return Ok(true);
+                if self.is_dependent_op_inner(parent_op, target, visited)? {
+                    return Ok(true);
+                }
             }
         }
 

@@ -3,6 +3,11 @@
 mod bindings;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "metal")]
+pub mod metal;
+#[cfg(all(feature = "metal", not(target_os = "macos")))]
+compile_error!("the `metal` feature requires macOS");
+mod dialect;
 pub mod mock;
 #[cfg(feature = "rocm")]
 pub mod rocm;
@@ -10,7 +15,6 @@ pub mod rocm;
 use std::{
     ffi::{CString, c_void},
     fmt,
-    hash::Hash,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -18,11 +22,12 @@ use std::{
 };
 
 pub use bindings::{DeviceProps, Dim3, GemmConfig};
+pub use dialect::Dialect;
 
 /// Marker trait for the CUDA and ROCm runtimes to implement
 pub trait Gpu: bindings::GpuBindings<Err = Self::Error, Ptr = Self::DevicePtr> {
     type Error: fmt::Debug + Eq + From<String>;
-    type DevicePtr: Copy + Default + Eq + Hash + Ord;
+    type DevicePtr: Copy + Default + Eq + Ord;
 }
 
 impl<G: bindings::GpuBindings> Gpu for G {
@@ -68,6 +73,10 @@ impl<G: Gpu> Device<G> {
 
     pub fn props(&self) -> &DeviceProps {
         &self.props
+    }
+
+    pub fn dialect(&self) -> Dialect {
+        self.props.dialect()
     }
 
     /// Set this device as currently active for this thread,
@@ -155,8 +164,8 @@ pub struct Stream<G: Gpu> {
 
 impl<G: Gpu> Drop for Stream<G> {
     fn drop(&mut self) {
-        self.sync().unwrap();
-        unsafe { G::stream_destroy(self.inner).unwrap() };
+        let _ = self.sync();
+        let _ = unsafe { G::stream_destroy(self.inner) };
     }
 }
 
@@ -272,7 +281,7 @@ pub struct Module<G: Gpu> {
 impl<G: Gpu> Drop for Module<G> {
     fn drop(&mut self) {
         let _ = self.device.set();
-        unsafe { G::module_destroy(self.module).unwrap() }
+        let _ = unsafe { G::module_destroy(self.module) };
     }
 }
 
@@ -306,14 +315,15 @@ impl<G: Gpu> Module<G> {
     pub fn get_kernel(self: Arc<Self>, name: impl Into<String>) -> Result<Kernel<G>, G::Error> {
         self.device.set()?;
 
-        let name = CString::new(name.into()).map_err(|e| format!("{e:?}"))?;
-        let kernel = unsafe { G::module_get_kernel(self.module, &name)? };
+        let name = name.into();
+        let cname = CString::new(name.clone()).map_err(|e| format!("{e:?}"))?;
+        let kernel = unsafe { G::module_get_kernel(self.module, &cname)? };
 
         unsafe {
             G::kernel_load(kernel)?;
         }
 
-        Ok(Kernel { kernel, module: self.clone() })
+        Ok(Kernel { name, kernel, module: self.clone() })
     }
 
     /// Get device that this module is on
@@ -323,8 +333,16 @@ impl<G: Gpu> Module<G> {
 }
 
 pub struct Kernel<G: Gpu> {
+    name: String,
     kernel: G::Kernel,
     module: Arc<Module<G>>,
+}
+
+impl<G: Gpu> Drop for Kernel<G> {
+    fn drop(&mut self) {
+        let _ = self.module.device.set();
+        let _ = unsafe { G::kernel_destroy(self.kernel) };
+    }
 }
 
 impl<G: Gpu> Kernel<G> {
@@ -343,7 +361,7 @@ impl<G: Gpu> Kernel<G> {
         stream: &Stream<G>,
         grid_dim: Dim3,
         block_size: u32,
-        args: *mut *mut c_void,
+        args: &mut [*mut c_void],
         smem: u32,
     ) -> Result<(), G::Error> {
         let o1 = stream.device.ordinal();
@@ -360,6 +378,16 @@ impl<G: Gpu> Kernel<G> {
 
         stream.device.set()?;
         unsafe { G::kernel_launch(self.kernel, stream.inner, grid_dim, block_dim, args, smem) }
+    }
+
+    /// Get the name of the kernel
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get the raw kernel handle
+    pub fn id(&self) -> G::Kernel {
+        self.kernel
     }
 
     /// Get the device that this kernel is on
@@ -425,7 +453,7 @@ impl<G: Gpu> Blas<G> {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,15 +500,27 @@ mod tests {
         let device = Device::<G>::new(0)?;
         let stream = device.new_stream()?;
 
-        let add_one_kernel = "
-            extern \"C\" __global__ void kernel(const int size, const float* src, float* dst) {
-                const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-                if (tid < size) dst[tid] = src[tid] + 1.0;
+        let kernel_src = match device.dialect() {
+            Dialect::CudaHip => {
+                "extern \"C\" __global__ void add_one(const float* src, float* dst) {
+                    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+                    dst[tid] = src[tid] + 1.0;
+                }"
             }
-        ";
+            Dialect::Msl => {
+                "#include <metal_stdlib>
+                using namespace metal;
+                kernel void add_one(
+                    device const float* src [[buffer(0)]],
+                    device float* dst [[buffer(1)]],
+                    uint tid [[thread_position_in_grid]]
+                ) {
+                    dst[tid] = src[tid] + 1.0;
+                }"
+            }
+        };
 
-        let module = Module::new(device.clone(), add_one_kernel)?;
-        let kernel = module.get_kernel("kernel")?;
+        let kernel = Module::new(device.clone(), kernel_src)?.get_kernel("add_one")?;
 
         unsafe {
             let dev_src = device.malloc(16)?;
@@ -489,16 +529,14 @@ mod tests {
             stream.memcpy_h2d(host_src.as_ptr().cast(), dev_src, 16)?;
 
             let gdim = Dim3 { x: 1, y: 1, z: 1 };
-            let size = 4i32;
             let mut args = Vec::new();
-            args.push((&size) as *const i32 as *mut c_void);
             args.push((&dev_src) as *const G::DevicePtr as *mut c_void);
             args.push((&dev_dst) as *const G::DevicePtr as *mut c_void);
 
-            kernel.launch(&stream, gdim, 4, args.as_mut_ptr(), 0)?;
+            kernel.launch(&stream, gdim, 4, &mut args, 0)?;
 
-            stream.memcpy_d2h(dev_dst, host_dst.as_mut_ptr().cast(), 16)?;
             stream.sync()?;
+            stream.memcpy_d2h(dev_dst, host_dst.as_mut_ptr().cast(), 16)?;
 
             device.free(dev_src)?;
             device.free(dev_dst)?;
@@ -548,6 +586,26 @@ mod tests {
         #[test]
         fn compile_load_execute_kernel() -> Result<(), ROCmError> {
             super::compile_load_execute_kernel::<ROCm>()
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    mod metal {
+        use crate::runtime::metal::{Metal, MetalError};
+
+        #[test]
+        fn create_malloc_copy_sync_drop() -> Result<(), MetalError> {
+            super::create_malloc_copy_sync_drop::<Metal>()
+        }
+
+        #[test]
+        fn multiple_device_instances() -> Result<(), MetalError> {
+            super::multiple_device_instances::<Metal>()
+        }
+
+        #[test]
+        fn compile_load_execute_kernel() -> Result<(), MetalError> {
+            super::compile_load_execute_kernel::<Metal>()
         }
     }
 }

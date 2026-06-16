@@ -5,15 +5,16 @@ use crate::{
     tensor::{
         DValue, IRTrace, Tensor, TensorIR,
         operation::{
-            BroadcastAcrossDimension, CABinary, CABinaryOp, Constant, CopyOp, Power, ScalarConstant, SparseMatmulBwd,
-            SparseMatmulBwdMulti, UnaryOp,
+            CABinary, CABinaryOp, Constant, CopyOp, Power, ScalarConstant, SliceAcrossDimension, SparseMatmul,
+            SparseMatmulBwd, SparseMatmulBwdMulti, Unary, UnaryOp,
+            autograd::{CReLU, CustomAutogradOp, DiffableFromOutputOp, ReLU, SCReLU, Sigmoid, SqrReLU},
         },
         transform::modify::AddOperation,
     },
 };
 
 #[cfg(test)]
-use crate::tensor::{Size, TValue};
+use crate::tensor::TValue;
 
 /// A fold rule is a special case for the simplest form of rewrite, that being an
 /// entirely local transform on an operation, changing only the operation itself
@@ -101,19 +102,7 @@ macro_rules! foldrule {
 }
 
 foldrule! {
-    rulename EvalScalarConstUnary on ir
-    rewrites (unary = [UnaryOp] (scalar = [ScalarConstant]))
-    into [ScalarConstant(unary.op().evaluate(scalar.0).unwrap(), scalar.1)]
-}
-
-foldrule! {
-    rulename EvalScalarConstBinary on ir
-    rewrites (binary = [CABinaryOp] (lhs = [ScalarConstant]) (rhs = [ScalarConstant]))
-    into [ScalarConstant(binary.op().evaluate(lhs.0, rhs.0).unwrap(), lhs.1)]
-}
-
-foldrule! {
-    rulename FoldFixedSizeScalarConst on ir
+    rulename FoldConstToScalarConst on ir
     rewrites (constant = [Constant])
     into [ScalarConstant(scalar, constant.0.size().into())]
     given {
@@ -121,16 +110,6 @@ foldrule! {
     }
     testcase fixed_size_scalar_const {
         ir.add_const(TValue::I32(vec![1; 16]))
-    }
-}
-
-foldrule! {
-    rulename FoldVarSizeScalarConst on ir
-    rewrites (broadcast = [BroadcastAcrossDimension] (input = [ScalarConstant]))
-    into [ScalarConstant(input.0, broadcast.output_size())]
-    testcase var_size_scalar_const {
-        let a = ir.add_scalar(1, 1);
-        ir.add_broadcast(a, [1], 0, Size::variable())?
     }
 }
 
@@ -170,5 +149,114 @@ foldrule! {
     into [CopyOp(a.ty())] (a)
     given {
         scalar.0 == 1.0.into()
+    }
+}
+
+foldrule! {
+    rulename FoldPowBy2 on ir
+    rewrites (_b = [Power] (a) (scalar = [ScalarConstant]))
+    into [CABinaryOp::new(a.ty(), CABinary::Mul)] (a) (a)
+    given {
+        scalar.0 == 2.0.into() || scalar.0 == 2.into()
+    }
+}
+
+foldrule! {
+    rulename FoldAbsSquared on ir
+    rewrites (_c = [CABinaryOp] (a = [UnaryOp] (i1)) (b = [UnaryOp] (i2)))
+    into [CABinaryOp::new(i1.ty(), CABinary::Mul)] (i1) (i1)
+    given {
+        a.op() == Unary::Abs && b.op() == Unary::Abs && i1.id() == i2.id()
+    }
+}
+
+foldrule! {
+    rulename PeepholeReLU on ir
+    rewrites (relu = [CABinaryOp] (scalar = [ScalarConstant]) (input))
+    into [{
+        let ty = input.ty();
+        let op = DiffableFromOutputOp(ReLU, ty.dtype(), ty.size());
+        CustomAutogradOp::new(op)?
+    }] (input)
+    given {
+        relu.op() == CABinary::Max && scalar.0 == DValue::zero(input.ty().dtype())
+    }
+}
+
+foldrule! {
+    rulename PeepholeCReLU on ir
+    rewrites (crelu = [CABinaryOp] (scalar = [ScalarConstant]) (relu = [CustomAutogradOp] (input)))
+    into [{
+        let ty = input.ty();
+        let op = DiffableFromOutputOp(CReLU, ty.dtype(), ty.size());
+        CustomAutogradOp::new(op)?
+    }] (input)
+    given {
+        relu.downcast::<DiffableFromOutputOp<ReLU>>().is_some() && crelu.op() == CABinary::Min && scalar.0 == DValue::one(input.ty().dtype())
+    }
+}
+
+foldrule! {
+    rulename PeepholeSCReLU on ir
+    rewrites (screlu = [CABinaryOp] (crelu1 = [CustomAutogradOp] (input1)) (crelu2 = [CustomAutogradOp] (input2)))
+    into [{
+        let ty = input1.ty();
+        let op = DiffableFromOutputOp(SCReLU, ty.dtype(), ty.size());
+        CustomAutogradOp::new(op)?
+    }] (input1)
+    given {
+        {
+            let op1 = crelu1.downcast::<DiffableFromOutputOp<CReLU>>();
+            let op2 = crelu2.downcast::<DiffableFromOutputOp<CReLU>>();
+            op1.is_some() && op1 == op2 && input1.id() == input2.id() && screlu.op() == CABinary::Mul
+        }
+    }
+}
+
+foldrule! {
+    rulename PeepholeSqrReLU on ir
+    rewrites (screlu = [CABinaryOp] (relu1 = [CustomAutogradOp] (input1)) (relu2 = [CustomAutogradOp] (input2)))
+    into [{
+        let ty = input1.ty();
+        let op = DiffableFromOutputOp(SqrReLU, ty.dtype(), ty.size());
+        CustomAutogradOp::new(op)?
+    }] (input1)
+    given {
+        {
+            let op1 = relu1.downcast::<DiffableFromOutputOp<ReLU>>();
+            let op2 = relu2.downcast::<DiffableFromOutputOp<ReLU>>();
+            op1.is_some() && op1 == op2 && input1.id() == input2.id() && screlu.op() == CABinary::Mul
+        }
+    }
+}
+
+foldrule! {
+    rulename PeepholeSigmoid on ir
+    rewrites (
+        sigmoid = [UnaryOp]
+            (denom = [CABinaryOp]
+                (one = [ScalarConstant])
+                (exp = [UnaryOp] (neg = [CABinaryOp] (neg_one = [ScalarConstant]) (input)))))
+    into [{
+        let ty = input.ty();
+        let op = DiffableFromOutputOp(Sigmoid, ty.dtype(), ty.size());
+        CustomAutogradOp::new(op)?
+    }] (input)
+    given {
+        sigmoid.op() == Unary::Reciprocal
+            && denom.op() == CABinary::Add
+            && one.0 == 1.0.into()
+            && exp.op() == Unary::Exp
+            && neg.op() == CABinary::Mul
+            && neg_one.0 == (-1.0).into()
+    }
+}
+
+foldrule! {
+    rulename FoldSlicedSparseMatmul on ir
+    rewrites (spmm = [SparseMatmul] (sliced = [SliceAcrossDimension] (weights)) (inputs))
+    into [SparseMatmul::new(spmm.dtype(), spmm.batch(), spmm.rows(), spmm.cols(), sliced.dimen(), sliced.start(), spmm.nnz())?] (weights) (inputs)
+    given {
+        spmm.offset() == 0 && spmm.rows() == spmm.stride() && sliced.inner().get() == 1
     }
 }

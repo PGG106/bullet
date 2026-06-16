@@ -6,8 +6,9 @@ use std::{
 
 use crate::game::formats::bulletformat::ChessBoard;
 
-use super::{DataLoader, rng::SimpleRand};
+use super::rng::SimpleRand;
 
+use bullet_trainer::reader::DataReader;
 use montyformat::{
     FastDeserialise, MontyValueFormat,
     chess::{Move, Position},
@@ -36,26 +37,18 @@ impl<T: Fn(&Position, Move, i16, f32) -> bool> MontyBinpackLoader<T> {
     }
 }
 
-impl<T> DataLoader<ChessBoard> for MontyBinpackLoader<T>
+impl<T> DataReader<ChessBoard> for MontyBinpackLoader<T>
 where
     T: Fn(&Position, Move, i16, f32) -> bool + Clone + Send + Sync + 'static,
 {
-    fn data_file_paths(&self) -> &[String] {
-        &self.file_paths
-    }
-
-    fn count_positions(&self) -> Option<u64> {
-        None
-    }
-
-    fn map_chunks<F: FnMut(&[ChessBoard]) -> bool>(&self, _: usize, mut f: F) {
+    fn read_chunks<F: FnMut(&[ChessBoard]) -> bool>(&self, _: usize, mut f: F) {
         let mut shuffle_buffer = Vec::new();
         shuffle_buffer.reserve_exact(self.buffer_size);
 
         let file_paths = self.file_paths.clone();
         let buffer_size = self.buffer_size;
 
-        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(256);
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(4);
         let (msg_sender, msg_receiver) = mpsc::sync_channel::<bool>(1);
 
         std::thread::spawn(move || {

@@ -1,20 +1,19 @@
-use bullet_trainer::model::Model as TrainerModel;
+pub use bullet_compiler::model::{Affine, InitSettings, ModelBuilder, ModelNode, Shape};
 
-pub use bullet_trainer::model::{
-    Shape,
-    builder::{Affine, InitSettings, ModelBuilder, ModelNode},
-};
+#[cfg(all(feature = "metal", any(feature = "cuda", feature = "rocm")))]
+compile_error!("The 'metal' feature cannot be enabled at the same time as 'cuda' or 'rocm'. Choose one GPU backend.");
 
 #[cfg(feature = "cuda")]
 pub type ExecutionContext = bullet_gpu::runtime::cuda::Cuda;
 
-#[cfg(feature = "rocm")]
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
 pub type ExecutionContext = bullet_gpu::runtime::rocm::ROCm;
 
-#[cfg(not(any(feature = "cuda", feature = "rocm")))]
-pub type ExecutionContext = bullet_gpu::runtime::mock::MockGpu;
+#[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+pub type ExecutionContext = bullet_gpu::runtime::metal::Metal;
 
-pub type Model = TrainerModel<ExecutionContext>;
+#[cfg(not(any(feature = "cuda", feature = "rocm", feature = "metal")))]
+pub type ExecutionContext = bullet_gpu::runtime::mock::MockGpu;
 
 pub mod optimiser {
     use super::ExecutionContext;

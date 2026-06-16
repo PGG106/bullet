@@ -4,7 +4,7 @@ use crate::{
     ir::{NodeId, OpId},
     tensor::{
         IRTrace, TValue, TensorIR, TensorOp,
-        operation::{Constant, ScalarConstant},
+        operation::{Constant, CopyOp, ScalarConstant},
         transform::{IRTransform, eliminate::*, foldrules::*, ordering::*, rewriterules::*},
     },
 };
@@ -27,14 +27,14 @@ impl CanonicalisePass {
             .add_cleanup(EliminateUnusedOperations)
             .add_cleanup(EliminateCommonSubExpressions)
             .add_cleanup(EliminateCopies)
-            .add_fold(EvalScalarConstUnary)
-            .add_fold(EvalScalarConstBinary)
-            .add_fold(FoldFixedSizeScalarConst)
-            .add_fold(FoldVarSizeScalarConst)
+            .add_fold(FoldConstToScalarConst)
             .add_fold(FoldConstIdentities)
             .add_fold(FoldMulByZero)
             .add_fold(FoldSparseMatmulBwdToMulti)
             .add_fold(FoldPowBy1)
+            .add_fold(FoldPowBy2)
+            .add_fold(FoldAbsSquared)
+            .add_fold(FoldSlicedSparseMatmul)
             .add_rewrite(BroadcastUnaryIntoUnaryBroadcast)
             .add_rewrite(BroadcastBinaryIntoBinaryBroadcast)
             .add_rewrite(ScalarBroadcastBinaryIntoBinaryBroadcast)
@@ -42,8 +42,21 @@ impl CanonicalisePass {
             .add_rewrite(CombineMulXAddMulX)
             .add_rewrite(FactoriseDistributive)
             .add_rewrite(ConcatMatmulToAddSlicedMatmuls)
-            .add_rewrite(AutogradConcatMatmulToAddSlicedMatmuls)
             .add_rewrite(CombineSparseMatmulBwds)
+    }
+
+    pub fn peephole_activations() -> Self {
+        Self::default()
+            .add_cleanup(OrderCommutativeInputs)
+            .add_cleanup(EliminateCopies)
+            .add_cleanup(EliminateUnusedOperations)
+            .add_cleanup(EliminateCommonSubExpressions)
+            .add_cleanup(EliminateCopies)
+            .add_fold(PeepholeReLU)
+            .add_fold(PeepholeCReLU)
+            .add_fold(PeepholeSCReLU)
+            .add_fold(PeepholeSqrReLU)
+            .add_fold(PeepholeSigmoid)
     }
 
     pub fn add_cleanup(mut self, cleanup: impl IRTransform) -> Self {
@@ -98,7 +111,7 @@ impl CanonicalisePass {
     }
 
     fn try_evaluate(ir: &TensorIR, inputs: &[NodeId], op: &TensorOp) -> Result<Option<Vec<Constant>>, IRTrace> {
-        if !inputs.is_empty() {
+        if !(inputs.is_empty() || (op.downcast::<CopyOp>().is_some() && ir.is_output(inputs[0]))) {
             let mut consts = Vec::new();
 
             for &input in inputs {
@@ -106,7 +119,7 @@ impl CanonicalisePass {
 
                 if let Some(Constant(value)) = parent.data().downcast().cloned() {
                     consts.push(value);
-                } else if let Some(Some(scalar)) = parent.data().downcast().map(ScalarConstant::to_tensor) {
+                } else if let Some(scalar) = parent.data().downcast().map(ScalarConstant::to_tensor) {
                     consts.push(scalar);
                 } else {
                     return Ok(None);
@@ -115,11 +128,7 @@ impl CanonicalisePass {
 
             let mut tensors = Vec::new();
             for &ty in &op.0.outputs() {
-                if let Some(size) = ty.size().evaluate_constant() {
-                    tensors.push(TValue::zeros(ty.dtype(), size));
-                } else {
-                    return Ok(None);
-                }
+                tensors.push(TValue::zeros(ty.dtype(), ty.size().get()));
             }
 
             op.0.evaluate(consts.iter().collect(), tensors.iter_mut().collect());
@@ -164,7 +173,7 @@ mod tests {
     fn test_complex() -> Result<(), IRTrace> {
         let mut ir = TensorIR::default();
 
-        let size = Size::variable();
+        let size = Size::from(32);
 
         let a = ir.add_scalar(1, 1);
         let ba = BroadcastAcrossDimension::new(DType::I32, [1], 0, size);

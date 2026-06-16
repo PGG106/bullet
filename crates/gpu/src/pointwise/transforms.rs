@@ -72,17 +72,10 @@ impl IRTransform for FusePointwise {
                         let (subgraph, inputs, outputs) = fuse_subgraphs(ir, op_i, op_j)?;
                         if let Some(pntwise) = FusedPointwise::new(subgraph.clone(), &self.0)? {
                             let new_cost = pntwise.ir.estimate_memory_cost()?;
-                            let old_cost = costs.get(&op_i).unwrap().dominator_sum(*costs.get(&op_j).unwrap());
+                            let old_cost = *costs.get(&op_i).unwrap() + *costs.get(&op_j).unwrap();
 
-                            if new_cost.is_le(old_cost) {
-                                let saving = if new_cost.var_power() != old_cost.var_power() {
-                                    Some(old_cost)
-                                } else if new_cost.factor() != old_cost.factor() {
-                                    Some(old_cost - new_cost)
-                                } else {
-                                    None
-                                };
-
+                            if new_cost.get() <= old_cost.get() {
+                                let saving = old_cost.get() - new_cost.get();
                                 cache.insert((op_i, op_j), (pntwise, inputs, outputs, new_cost, saving));
                                 candidates.insert((op_i, op_j));
                                 continue 'inner;
@@ -103,11 +96,7 @@ impl IRTransform for FusePointwise {
                 for arg in candidates {
                     let (_, _, _, _, saving) = cache.get(&arg).unwrap();
 
-                    if match (max_saving, saving) {
-                        (Some(x), Some(y)) => x.is_le(*y),
-                        (None, Some(_)) => true,
-                        (_, None) => false,
-                    } {
+                    if max_saving <= *saving {
                         max_saving = *saving;
                         argmin = arg;
                     }
@@ -135,14 +124,15 @@ impl IRTransform for FusePointwise {
 }
 
 /// Codegen FusedPointwise ops to KernelSrc
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CodegenPointwise;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodegenPointwise(pub DeviceProps);
+
 impl IRTransform for CodegenPointwise {
     fn apply(&self, ir: &mut TensorIR) -> Result<(), IRTrace> {
         // lower fused pointwise to KernelSrc ops
         for op in ir.operations() {
             if let Some(pntwise) = op.data().downcast::<FusedPointwise>() {
-                let src = unsafe { pntwise.ir.lower(format!("kernel{}", op.id().inner()))? };
+                let src = unsafe { pntwise.ir.lower(format!("kernel{}", pntwise.id()), &self.0)? };
 
                 for (&i1, &i2) in op.data().inputs().iter().zip(src.inputs.iter()) {
                     if i1 != i2 {
@@ -190,7 +180,7 @@ fn fuse_subgraphs(ir: &TensorIR, op_i: OpId, op_j: OpId) -> Result<(SubGraph, Ve
     for (&out, &new_out) in op_i.outputs().iter().zip(outputs_i.iter()) {
         map.insert(out, new_out);
 
-        if !op_j_set.contains(&out) || ir.get_node(out)?.children() > 1 {
+        if !op_j_set.contains(&out) || ir.is_output(out) || ir.get_node(out)?.children() > 1 {
             total_outputs.push(out);
             new_sub.register_output(new_out);
         }

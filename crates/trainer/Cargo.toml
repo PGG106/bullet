@@ -11,9 +11,18 @@ edition = { workspace = true }
 [dependencies]
 bullet-compiler = { workspace = true }
 bullet-gpu = { workspace = true }
-rand = "0.9"
-rand_distr = "0.5.1"
+rand_xoshiro = "=0.8.1"
+rand_distr = "=0.6.0"
 
 [features]
 cuda = ["bullet-gpu/cuda"]
 rocm = ["bullet-gpu/rocm"]
+metal = ["bullet-gpu/metal"]
+
+[[example]]
+name = "ataxx"
+path = "../../examples/ataxx.rs"
+
+[[example]]
+name = "test4"
+path = "../../examples/tests/test4.rs"
