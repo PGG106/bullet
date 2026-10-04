@@ -2,23 +2,31 @@ use std::{cell::RefCell, mem::MaybeUninit};
 
 use bullet_lib::{
     game::{
-        inputs::{ChessBucketsMirrored, get_num_buckets},
-        outputs::MaterialCount,
+        inputs::{ChessBucketsMirrored, SparseInputType, get_num_buckets},
+        outputs::OutputBuckets,
     },
-    nn::{
-        InitSettings, Shape,
-        optimiser::{AdamW, AdamWParams},
+    trainer::schedule::{
+        lr::{self, LrScheduler},
+        wdl,
     },
-    trainer::{
-        save::SavedFormat,
-        schedule::{TrainingSchedule, TrainingSteps, lr, wdl},
-        settings::LocalSettings,
+    value::{
+        loader::SfBinpackLoader,
+        save::{save_to_checkpoint, write_losses},
     },
-    value::{ValueTrainerBuilder, loader::DirectSequentialDataLoader},
+    wdl::WdlScheduler,
 };
-
-use bullet_lib::game::outputs::OutputBuckets;
-use bullet_lib::value::loader::SfBinpackLoader;
+use bullet_trainer::{
+    model::{
+        DenseInput, InitSettings, ModelDefinition, ModelEvaluator, ModelInputs, ModelInputsMapper, ModelWeights,
+        SavedFormat, Shape, SparseInput,
+    },
+    optimiser::{
+        Optimiser,
+        adam::{AdamW, AdamWParams},
+    },
+    reader::ReadMapLoader,
+    run::{DefaultDevice, TrainingSchedule, TrainingSteps, train},
+};
 use rand::{
     Rng, SeedableRng,
     distr::{Bernoulli, Distribution},
@@ -26,14 +34,39 @@ use rand::{
     rngs::StdRng,
 };
 use sfbinpack::TrainingDataEntry;
+use sfbinpack::chess::attacks;
+use sfbinpack::chess::bitboard::Bitboard;
+use sfbinpack::chess::r#move::Move;
 use sfbinpack::chess::r#move::MoveType;
 use sfbinpack::chess::piecetype::PieceType;
 use sfbinpack::chess::position::Position;
-use sfbinpack::chess::r#move::Move;
-use sfbinpack::chess::bitboard::Bitboard;
-use sfbinpack::chess::attacks;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
+
+const NET_NAME: &str = "fixedwdl";
+const READ_BUF_MB: usize = 4096;
+const READ_THREADS: usize = 4;
+const MAP_THREADS: u8 = 2;
+const SAVE_RATE: usize = 80;
+const CHECKPOINT_PATH: &str = "checkpoints\\fixedwdl-stage1-800";
+const STAGE1_DATA_PATHS: [&str; 3] = [
+    "data/master.binpack",
+    "data/test79-2022-03-mar-16tb7p.v6-dd.binpack",
+    "data/test79-2022-04-apr-16tb7p.v6-dd.binpack",
+];
+const STAGE2_DATA_PATHS: [&str; 2] = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack"];
+const RUN_STAGE2: bool = false;
+
+const L1: usize = 1536;
+const CLIP: f32 = 1.98;
+const L2: usize = 16;
+const L3: usize = 32;
+const EVAL_SCALE: f32 = 362.0;
+const STAGE1_SUPERBATCHES: usize = 800;
+const STAGE2_START_SUPERBATCH: usize = 801;
+const STAGE2_END_SUPERBATCH: usize = 1000;
+const STAGE1_INITIAL_LR: f32 = 0.001;
+const STAGE1_FINAL_LR: f32 = STAGE1_INITIAL_LR * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
 
 #[derive(Clone, Copy, Default)]
 pub struct CJBucket;
@@ -196,8 +229,10 @@ pub fn static_exchange_eval(pos: &Position, m: Move, threshold: i32) -> bool {
     let mut colour = !pos.side_to_move();
 
     let get_attackers = |sq, occ: Bitboard| {
-        (attacks::pawn(sfbinpack::chess::color::Color::White, sq) & pos.pieces_bb_color(sfbinpack::chess::color::Color::Black, PieceType::Pawn)
-            | attacks::pawn(sfbinpack::chess::color::Color::Black, sq) & pos.pieces_bb_color(sfbinpack::chess::color::Color::White, PieceType::Pawn)
+        (attacks::pawn(sfbinpack::chess::color::Color::White, sq)
+            & pos.pieces_bb_color(sfbinpack::chess::color::Color::Black, PieceType::Pawn)
+            | attacks::pawn(sfbinpack::chess::color::Color::Black, sq)
+                & pos.pieces_bb_color(sfbinpack::chess::color::Color::White, PieceType::Pawn)
             | attacks::knight(sq) & pos.pieces_bb_type(PieceType::Knight)
             | attacks::king(sq) & pos.pieces_bb_type(PieceType::King)
             | attacks::bishop(sq, occ) & (pos.pieces_bb_type(PieceType::Bishop) | pos.pieces_bb_type(PieceType::Queen))
@@ -226,16 +261,15 @@ pub fn static_exchange_eval(pos: &Position, m: Move, threshold: i32) -> bool {
         occupied.set(lsb.index(), false);
 
         // diagonal moves reveal bishops and queens:
-        if next_victim == PieceType::Pawn
-            || next_victim == PieceType::Bishop
-            || next_victim == PieceType::Queen
-        {
-            attackers |= attacks::bishop(to, occupied) & (pos.pieces_bb_type(PieceType::Bishop) | pos.pieces_bb_type(PieceType::Queen));
+        if next_victim == PieceType::Pawn || next_victim == PieceType::Bishop || next_victim == PieceType::Queen {
+            attackers |= attacks::bishop(to, occupied)
+                & (pos.pieces_bb_type(PieceType::Bishop) | pos.pieces_bb_type(PieceType::Queen));
         }
 
         // orthogonal moves reveal rooks and queens:
         if next_victim == PieceType::Rook || next_victim == PieceType::Queen {
-            attackers |= attacks::rook(to, occupied) & (pos.pieces_bb_type(PieceType::Rook) | pos.pieces_bb_type(PieceType::Queen));
+            attackers |= attacks::rook(to, occupied)
+                & (pos.pieces_bb_type(PieceType::Rook) | pos.pieces_bb_type(PieceType::Queen));
         }
 
         attackers = attackers & occupied;
@@ -272,169 +306,224 @@ const NUM_OUTPUT_BUCKETS: usize = 8;
 
 const NUM_INPUT_BUCKETS: usize = get_num_buckets(&BUCKET_LAYOUT);
 
-fn main() {
-    // hyperparams to fiddle with
-    const L1: usize = 1536;
-    const CLIP: f32 = 1.98;
-    const L2: usize = 16;
-    const L3: usize = 32;
-    let name = "fixedwdl";
-    let dataset_path = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack", "data/test79-2022-04-apr-16tb7p.v6-dd.binpack"];
-    let s1_initial_lr = 0.001;
-    let s1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
-    const STAGE1_SB: usize = 800;
-    let mut trainer = ValueTrainerBuilder::default()
-        .dual_perspective()
-        .optimiser(AdamW)
-        .inputs(ChessBucketsMirrored::new(BUCKET_LAYOUT))
-        .output_buckets(CJBucket)
-        .save_format(&[
-            SavedFormat::id("l0f"),
-            SavedFormat::id("l0w"),
-            SavedFormat::id("l0b"),
-            SavedFormat::id("l1w"),
-            SavedFormat::id("l1b"),
-            SavedFormat::id("l2w"),
-            SavedFormat::id("l2b"),
-            SavedFormat::id("l3w"),
-            SavedFormat::id("l3b"),
-        ])
-        .build_custom(|builder, (stm_inputs, ntm_inputs, output_buckets), target| {
-            let l0f = builder.new_weights("l0f", Shape::new(L1, 768), InitSettings::Zeroed);
-            let expanded_factoriser = l0f.repeat(NUM_INPUT_BUCKETS);
+type InputTy = (((SparseInput, SparseInput), SparseInput), DenseInput<f32>);
 
-            // input layer weights
-            let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, L1);
-            l0.init_with_effective_input_size(32);
-            l0.weights = (l0.weights + expanded_factoriser).clip_pass_through_grad(-CLIP, CLIP);
-
-            // output layer weights
-            let l1 = builder.new_affine("l1", L1, NUM_OUTPUT_BUCKETS * L2);
-            let l2 = builder.new_affine("l2", L2 * 2, NUM_OUTPUT_BUCKETS * L3);
-            let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
-
-            let ft = |input, start, end| l0.slice(start, end).forward(input).crelu();
-            let stm_hidden = ft(stm_inputs, 0, L1 / 2) * ft(stm_inputs, L1 / 2, L1);
-            let ntm_hidden = ft(ntm_inputs, 0, L1 / 2) * ft(ntm_inputs, L1 / 2, L1);
-
-            let hl1 = stm_hidden.concat(ntm_hidden);
-
-            let ones_l1_vec = builder.new_constant(Shape::new(1, L1), &[1.0 / L1 as f32; L1]);
-            let l0_out_norm = ones_l1_vec.matmul(hl1);
-
-            let l1_out = l1.forward(hl1).select(output_buckets);
-            let hl2 = l1_out.concat(l1_out.abs_pow(2.0)).crelu();
-
-            let hl3 = l2.forward(hl2).select(output_buckets).screlu();
-            let l3_out = l3.forward(hl3).select(output_buckets);
-
-            let loss = l3_out.sigmoid().power_error(target, 2.5);
-            let loss = loss + 0.004 * l0_out_norm;
-
-            return (l3_out, loss);
+fn make_inputs_mapper(
+    inputs: &ModelInputs<InputTy>,
+    feature_getter: ChessBucketsMirrored,
+    output_buckets: CJBucket,
+    wdl: impl WdlScheduler,
+) -> ModelInputsMapper<bulletformat::ChessBoard> {
+    ModelInputsMapper::build(inputs, move |pos, step, (((stm, ntm), bucket), target)| {
+        let mut count = 0;
+        feature_getter.map_features(pos, |stm_feature, ntm_feature| {
+            stm[count] = stm_feature.try_into().unwrap();
+            ntm[count] = ntm_feature.try_into().unwrap();
+            count += 1;
         });
 
+        assert!(count <= feature_getter.max_active(), "More inputs provided than the specified maximum!");
+        if count < feature_getter.max_active() {
+            stm[count] = -1;
+            ntm[count] = -1;
+        }
 
+        bucket[0] = i32::from(output_buckets.bucket(pos));
+
+        let result = f32::from(pos.result) / 2.0;
+        let score = 1.0 / (1.0 + (f32::from(-pos.score) / EVAL_SCALE).exp());
+        let lambda = wdl.blend(step.batch(), step.superbatch(), step.final_superbatch());
+        assert!((0.0..=1.0).contains(&lambda), "WDL proportion must be in [0, 1]");
+        target[0] = lambda * result + (1.0 - lambda) * score;
+    })
+}
+
+fn main() {
+    let feature_getter = ChessBucketsMirrored::new(BUCKET_LAYOUT);
+    let output_buckets = CJBucket;
+    let inputs = ModelInputs::default()
+        .add_sparse("stm", (feature_getter.num_inputs(), 1), feature_getter.max_active())
+        .add_sparse("nstm", (feature_getter.num_inputs(), 1), feature_getter.max_active())
+        .add_sparse("buckets", (NUM_OUTPUT_BUCKETS, 1), 1)
+        .add_dense("targets", (1, 1));
+
+    let defn = ModelDefinition::build(&inputs, |builder, (((stm_inputs, ntm_inputs), output_buckets), target)| {
+        let l0f = builder.new_weights("l0f", Shape::new(L1, 768), InitSettings::Zeroed);
+        let expanded_factoriser = l0f.repeat(NUM_INPUT_BUCKETS);
+
+        // input layer weights
+        let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, L1);
+        l0.init_with_effective_input_size(32);
+        l0.weights = (l0.weights + expanded_factoriser).clip_pass_through_grad(-CLIP, CLIP);
+
+        // output layer weights
+        let l1 = builder.new_affine("l1", L1, NUM_OUTPUT_BUCKETS * L2);
+        let l2 = builder.new_affine("l2", L2 * 2, NUM_OUTPUT_BUCKETS * L3);
+        let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
+
+        let ft = |input, start, end| l0.slice(start, end).forward(input).crelu();
+        let stm_hidden = ft(stm_inputs, 0, L1 / 2) * ft(stm_inputs, L1 / 2, L1);
+        let ntm_hidden = ft(ntm_inputs, 0, L1 / 2) * ft(ntm_inputs, L1 / 2, L1);
+
+        let hl1 = stm_hidden.concat(ntm_hidden);
+
+        let ones_l1_vec = builder.new_constant(Shape::new(1, L1), &[1.0 / L1 as f32; L1]);
+        let l0_out_norm = ones_l1_vec.matmul(hl1);
+
+        let l1_out = l1.forward(hl1).select(output_buckets);
+        let hl2 = l1_out.concat(l1_out.abs_pow(2.0)).crelu();
+
+        let hl3 = l2.forward(hl2).select(output_buckets).screlu();
+        let l3_out = l3.forward(hl3).select(output_buckets);
+
+        let loss = l3_out.sigmoid().power_error(target, 2.5);
+        let loss = loss + 0.004 * l0_out_norm;
+
+        (Some(loss.reduce_sum_batch()), vec![("output".to_string(), l3_out)])
+    });
+
+    let weights = ModelWeights::new(&defn, 198273612);
+    let device = DefaultDevice::new(0).unwrap();
+    let mut evaluator = ModelEvaluator::new(&defn, device.clone()).unwrap();
+    let mut optimiser = Optimiser::<_, AdamW<_>>::new(defn, weights, device.clone(), AdamWParams::default()).unwrap();
     let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default() };
 
-    trainer.optimiser.set_params_for_weight("l2w", no_clipping);
-    trainer.optimiser.set_params_for_weight("l2b", no_clipping);
-    trainer.optimiser.set_params_for_weight("l3w", no_clipping);
-    trainer.optimiser.set_params_for_weight("l3b", no_clipping);
+    optimiser.set_params_for_weight("l2w", no_clipping);
+    optimiser.set_params_for_weight("l2b", no_clipping);
+    optimiser.set_params_for_weight("l3w", no_clipping);
+    optimiser.set_params_for_weight("l3b", no_clipping);
 
-    let wdl_scheduler = wdl::LinearWDL {start : 0.0,  end:0.15};
+    let saved_format = vec![
+        SavedFormat::id("l0f"),
+        SavedFormat::id("l0w"),
+        SavedFormat::id("l0b"),
+        SavedFormat::id("l1w"),
+        SavedFormat::id("l1b"),
+        SavedFormat::id("l2w"),
+        SavedFormat::id("l2b"),
+        SavedFormat::id("l3w"),
+        SavedFormat::id("l3b"),
+    ];
 
-    let lr_scheduler = lr::Warmup {
-        inner: lr::CosineDecayLR { initial_lr: s1_initial_lr, final_lr: s1_final_lr, final_superbatch: STAGE1_SB },
-        warmup_batches: 200,
+    optimiser.load_from_checkpoint(&format!("{CHECKPOINT_PATH}\\optimiser_state")).unwrap();
+
+    let mut run = |stage, start_superbatch, end_superbatch, lr_schedule, mapper, reader| {
+        let error_record = RefCell::new(Vec::new());
+        let mut loss_sum = 0.0;
+        let mut ticks_since_last = 0.0;
+
+        train(
+            &mut optimiser,
+            TrainingSchedule {
+                steps: TrainingSteps {
+                    batch_size: 16_384 * 8,
+                    batches_per_superbatch: 6104 / 8,
+                    start_superbatch,
+                    end_superbatch,
+                },
+                lr_schedule,
+                log_rate: 128,
+            },
+            ReadMapLoader::new(reader, mapper, MAP_THREADS),
+            |_, step, error| {
+                loss_sum += error;
+                ticks_since_last += 1.0;
+
+                if step.batch().is_multiple_of(32)
+                    || (step.batches_per_superbatch() < 32 && step.batch() == step.batches_per_superbatch())
+                {
+                    let normalised_loss = loss_sum / f32::min(ticks_since_last, step.batches_per_superbatch() as f32);
+                    error_record.borrow_mut().push((step.superbatch(), step.batch(), normalised_loss));
+                    loss_sum = 0.0;
+                    ticks_since_last = 0.0;
+                }
+            },
+            |optimiser, step| {
+                let superbatch = step.superbatch();
+                if superbatch.is_multiple_of(SAVE_RATE) || superbatch == step.final_superbatch() {
+                    let name = format!("{NET_NAME}-stage{stage}-{superbatch}");
+                    let path = format!("checkpoints/{name}");
+                    save_to_checkpoint(optimiser, &saved_format, &path);
+                    write_losses(&format!("{path}/log.txt"), &error_record.borrow());
+                    println!("Saved [{name}]");
+                }
+            },
+        )
+        .unwrap();
     };
 
-    let schedule = TrainingSchedule {
-        net_id: (name.to_owned() + "-stage1").to_string(),
-        eval_scale: 362.0,
-        steps: TrainingSteps {
-            batch_size: 16_384 * 8 ,
-            batches_per_superbatch: 6104 / 8,
-            start_superbatch: 1,
-            end_superbatch: STAGE1_SB,
-        },
-        wdl_scheduler: wdl_scheduler.clone(),
-        lr_scheduler: lr_scheduler.clone(),
-        save_rate: 80,
-    };
+    fn stage1_filter(entry: &TrainingDataEntry) -> bool {
+        entry.ply >= 16
+            && !entry.pos.is_checked(entry.pos.side_to_move())
+            && entry.score.unsigned_abs() <= 25000
+            && entry.mv.mtype() == MoveType::Normal
+            && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
+            && shouldkeep(entry.result, entry.score, &entry.pos)
+            && skip_piececount(&entry.pos)
+    }
 
-    let settings = LocalSettings { threads: 2, test_set: None, output_directory: "checkpoints", batch_queue_size: 64 };
-
-    // loading from a SF binpack
-    let dataloader = {
-        let file_path = dataset_path;
-        let buffer_size_mb = 4096;
-        let threads = 4;
-        fn filter(entry: &TrainingDataEntry) -> bool {
-            entry.ply >= 16
-                && !entry.pos.is_checked(entry.pos.side_to_move())
-                && entry.score.unsigned_abs() <= 25000
-                && (entry.mv.mtype() == MoveType::Normal)
-                && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
-                && shouldkeep(entry.result, entry.score, &entry.pos)
-                && skip_piececount(&entry.pos)
+    let reader = SfBinpackLoader::new_concat_multiple(
+        &STAGE1_DATA_PATHS,
+        READ_BUF_MB,
+        READ_THREADS,
+        stage1_filter as fn(&TrainingDataEntry) -> bool,
+    );
+    let mapper = make_inputs_mapper(&inputs, feature_getter, output_buckets, wdl::LinearWDL { start: 0.0, end: 0.15 });
+    run(
+        1,
+        1,
+        STAGE1_SUPERBATCHES,
+        lr::Warmup {
+            inner: lr::CosineDecayLR {
+                initial_lr: STAGE1_INITIAL_LR,
+                final_lr: STAGE1_FINAL_LR,
+                final_superbatch: STAGE1_SUPERBATCHES,
+            },
+            warmup_batches: 200,
         }
-        SfBinpackLoader::new_concat_multiple(&file_path, buffer_size_mb, threads, filter)
-    };
+        .boxed(),
+        mapper,
+        reader,
+    );
 
-    trainer.load_from_checkpoint("checkpoints\\fixedwdl-stage1-800");
-
-    //trainer.save_to_checkpoint("checkpoints\\fixed-shit");
-
-
-    trainer.run(&schedule, &settings, &dataloader);
-
-    // Stage 2
-
-    let wdl_scheduler = wdl::ConstantWDL {value:0.15};
-
-    let lr_scheduler = lr::Warmup {
-        inner: lr::CosineDecayLR { initial_lr: s1_initial_lr * 0.1, final_lr: s1_final_lr * 0.5, final_superbatch: 1000},
-        warmup_batches: 10,
-    };
-
-    // start at sb 700
-    let schedule = TrainingSchedule {
-        net_id: (name.to_owned() + "-stage2").to_string(),
-        eval_scale: 362.0,
-        steps: TrainingSteps {
-            batch_size: 16_384 * 8 ,
-            batches_per_superbatch: 6104 / 8,
-            start_superbatch: 801,
-            end_superbatch: 1000,
-        },
-        wdl_scheduler,
-        lr_scheduler,
-        save_rate: 80,
-    };
-
-    // use different binpack set
-    let dataset_path = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack"];
-
-
-    let dataloader = {
-        let file_path = dataset_path;
-        let buffer_size_mb = 4096;
-        let threads = 4;
-        fn filter(entry: &TrainingDataEntry) -> bool {
+    if RUN_STAGE2 {
+        fn stage2_filter(entry: &TrainingDataEntry) -> bool {
             entry.ply >= 28
                 && !entry.pos.is_checked(entry.pos.side_to_move())
                 && entry.score.unsigned_abs() <= 20000
                 && entry.mv.mtype() == MoveType::Normal
-                && (entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None)
+                && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
                 && shouldkeep(entry.result, entry.score, &entry.pos)
                 && skip_piececount(&entry.pos)
         }
-        SfBinpackLoader::new_concat_multiple(&file_path, buffer_size_mb, threads, filter)
-    };
 
-    // trainer.run(&schedule, &settings, &dataloader);
+        let reader = SfBinpackLoader::new_concat_multiple(
+            &STAGE2_DATA_PATHS,
+            READ_BUF_MB,
+            READ_THREADS,
+            stage2_filter as fn(&TrainingDataEntry) -> bool,
+        );
+        let mapper = make_inputs_mapper(&inputs, feature_getter, output_buckets, wdl::ConstantWDL { value: 0.15 });
+        run(
+            2,
+            STAGE2_START_SUPERBATCH,
+            STAGE2_END_SUPERBATCH,
+            lr::Warmup {
+                inner: lr::CosineDecayLR {
+                    initial_lr: STAGE1_INITIAL_LR * 0.1,
+                    final_lr: STAGE1_FINAL_LR * 0.5,
+                    final_superbatch: STAGE2_END_SUPERBATCH,
+                },
+                warmup_batches: 10,
+            }
+            .boxed(),
+            mapper,
+            reader,
+        );
+    }
 
+    evaluator.load_device_weights(optimiser.weights()).unwrap();
+    let evaluator_mapper = make_inputs_mapper(&inputs, feature_getter, output_buckets, wdl::ConstantWDL { value: 0.0 });
     for fen in [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
@@ -442,8 +531,11 @@ fn main() {
         "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
         "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
     ] {
-        let eval = trainer.eval(fen);
+        let pos = format!("{fen} | 0 | 0.0").parse().unwrap();
+        let inputs = evaluator_mapper.map(&[pos], Default::default(), 1).to_device(&device).unwrap();
+        let output = evaluator.evaluate(&inputs).unwrap().get("output").unwrap();
+        let [eval] = output.to_host().unwrap().f32()[..] else { panic!() };
         println!("FEN: {fen}");
-        println!("EVAL: {}", 362.0 * eval);
+        println!("EVAL: {}", EVAL_SCALE * eval);
     }
 }
