@@ -279,7 +279,7 @@ fn main() {
     const L2: usize = 16;
     const L3: usize = 32;
     let name = "fixedwdl";
-    let dataset_path = ["data/master.binpack"];
+    let dataset_path = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack", "data/test79-2022-04-apr-16tb7p.v6-dd.binpack"];
     let s1_initial_lr = 0.001;
     let s1_final_lr = 0.001 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3 * 0.3;
     const STAGE1_SB: usize = 800;
@@ -313,9 +313,10 @@ fn main() {
             let l2 = builder.new_affine("l2", L2 * 2, NUM_OUTPUT_BUCKETS * L3);
             let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
 
-            // inference
-            let stm_hidden = l0.forward(stm_inputs).crelu().pairwise_mul();
-            let ntm_hidden = l0.forward(ntm_inputs).crelu().pairwise_mul();
+            let ft = |input, start, end| l0.slice(start, end).forward(input).crelu();
+            let stm_hidden = ft(stm_inputs, 0, L1 / 2) * ft(stm_inputs, L1 / 2, L1);
+            let ntm_hidden = ft(ntm_inputs, 0, L1 / 2) * ft(ntm_inputs, L1 / 2, L1);
+
             let hl1 = stm_hidden.concat(ntm_hidden);
 
             let ones_l1_vec = builder.new_constant(Shape::new(1, L1), &[1.0 / L1 as f32; L1]);
@@ -327,7 +328,7 @@ fn main() {
             let hl3 = l2.forward(hl2).select(output_buckets).screlu();
             let l3_out = l3.forward(hl3).select(output_buckets);
 
-            let loss = (l3_out.sigmoid() - target).abs_pow(2.5);
+            let loss = l3_out.sigmoid().power_error(target, 2.5);
             let loss = loss + 0.004 * l0_out_norm;
 
             return (l3_out, loss);
@@ -370,9 +371,9 @@ fn main() {
         let buffer_size_mb = 4096;
         let threads = 4;
         fn filter(entry: &TrainingDataEntry) -> bool {
-            entry.ply >= 28
+            entry.ply >= 16
                 && !entry.pos.is_checked(entry.pos.side_to_move())
-                && entry.score.unsigned_abs() <= 20000
+                && entry.score.unsigned_abs() <= 25000
                 && (entry.mv.mtype() == MoveType::Normal)
                 && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
                 && shouldkeep(entry.result, entry.score, &entry.pos)
@@ -393,7 +394,7 @@ fn main() {
     let wdl_scheduler = wdl::ConstantWDL {value:0.15};
 
     let lr_scheduler = lr::Warmup {
-        inner: lr::CosineDecayLR { initial_lr: s1_initial_lr * 0.1, final_lr: s1_final_lr * 0.25, final_superbatch: 1000},
+        inner: lr::CosineDecayLR { initial_lr: s1_initial_lr * 0.1, final_lr: s1_final_lr * 0.5, final_superbatch: 1000},
         warmup_batches: 10,
     };
 
@@ -413,8 +414,8 @@ fn main() {
     };
 
     // use different binpack set
-    let dataset_path = [
-    "data/test78-junjulaug2022-16tb7p-eval-filt-v2-d6.binpack"];
+    let dataset_path = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack"];
+
 
     let dataloader = {
         let file_path = dataset_path;
@@ -432,7 +433,7 @@ fn main() {
         SfBinpackLoader::new_concat_multiple(&file_path, buffer_size_mb, threads, filter)
     };
 
-    trainer.run(&schedule, &settings, &dataloader);
+    // trainer.run(&schedule, &settings, &dataloader);
 
     for fen in [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
