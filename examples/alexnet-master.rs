@@ -57,9 +57,8 @@ const STAGE1_DATA_PATHS: [&str; 3] = [
 const STAGE2_DATA_PATHS: [&str; 2] = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack"];
 const RUN_STAGE2: bool = false;
 
-const L1_RANGE: f32 = i8::MAX as f32 / QB as f32; // 127 / 64 = 1.984375
-
 const L1: usize = 1536;
+const CLIP: f32 = 1.98;
 const L2: usize = 16;
 const L3: usize = 32;
 
@@ -391,21 +390,23 @@ fn main() {
     let device = DefaultDevice::new(0).unwrap();
     let mut evaluator = ModelEvaluator::new(&defn, device.clone()).unwrap();
     let mut optimiser = Optimiser::<_, AdamW<_>>::new(defn, weights, device.clone(), AdamWParams::default()).unwrap();
-    let l1_clip = AdamWParams { min_weight: -L1_RANGE, max_weight: L1_RANGE, ..Default::default() };
     let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default() };
 
-    optimiser.set_params_for_weight("l1w", l1_clip);
     optimiser.set_params_for_weight("l2w", no_clipping);
     optimiser.set_params_for_weight("l2b", no_clipping);
     optimiser.set_params_for_weight("l3w", no_clipping);
     optimiser.set_params_for_weight("l3b", no_clipping);
+
+    let l0_clip = AdamWParams { min_weight: -CLIP / 2.0, max_weight: CLIP / 2.0, ..Default::default() };
+    optimiser.set_params_for_weight("l0w", l0_clip);
+    optimiser.set_params_for_weight("l0f", l0_clip);
 
 
     let saved_format = vec![
         SavedFormat::id("l0w")
             .transform(|store, weights| {
                 let factoriser = store.get("l0f").values.f32().repeat(NUM_INPUT_BUCKETS);
-                weights.into_iter().zip(factoriser).map(|(a, b)| a + b).collect()
+                weights.iter().zip(factoriser).map(|(a, b)| a + b).collect()
             })
             .round()
             .quantise::<i16>(QA),
@@ -417,7 +418,7 @@ fn main() {
         SavedFormat::id("l3w"),
         SavedFormat::id("l3b"),
     ];
-
+    
     optimiser.load_from_checkpoint(&format!("{CHECKPOINT_PATH}\\optimiser_state")).unwrap();
 
     let mut run = |stage, start_superbatch, end_superbatch, lr_schedule, mapper, reader| {
