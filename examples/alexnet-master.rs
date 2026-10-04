@@ -57,11 +57,16 @@ const STAGE1_DATA_PATHS: [&str; 3] = [
 const STAGE2_DATA_PATHS: [&str; 2] = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack"];
 const RUN_STAGE2: bool = false;
 
+const L1_RANGE: f32 = i8::MAX as f32 / QB as f32; // 127 / 64 = 1.984375
+
 const L1: usize = 1536;
-const CLIP: f32 = 1.98;
 const L2: usize = 16;
 const L3: usize = 32;
+
 const EVAL_SCALE: f32 = 362.0;
+const QA: i16 = 255;
+const QB: i16 = 64;
+
 const STAGE1_SUPERBATCHES: usize = 800;
 const STAGE2_START_SUPERBATCH: usize = 801;
 const STAGE2_END_SUPERBATCH: usize = 1000;
@@ -386,18 +391,26 @@ fn main() {
     let device = DefaultDevice::new(0).unwrap();
     let mut evaluator = ModelEvaluator::new(&defn, device.clone()).unwrap();
     let mut optimiser = Optimiser::<_, AdamW<_>>::new(defn, weights, device.clone(), AdamWParams::default()).unwrap();
+    let l1_clip = AdamWParams { min_weight: -L1_RANGE, max_weight: L1_RANGE, ..Default::default() };
     let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default() };
 
+    optimiser.set_params_for_weight("l1w", l1_clip);
     optimiser.set_params_for_weight("l2w", no_clipping);
     optimiser.set_params_for_weight("l2b", no_clipping);
     optimiser.set_params_for_weight("l3w", no_clipping);
     optimiser.set_params_for_weight("l3b", no_clipping);
 
+
     let saved_format = vec![
-        SavedFormat::id("l0f"),
-        SavedFormat::id("l0w"),
-        SavedFormat::id("l0b"),
-        SavedFormat::id("l1w"),
+        SavedFormat::id("l0w")
+            .transform(|store, weights| {
+                let factoriser = store.get("l0f").values.f32().repeat(NUM_INPUT_BUCKETS);
+                weights.into_iter().zip(factoriser).map(|(a, b)| a + b).collect()
+            })
+            .round()
+            .quantise::<i16>(QA),
+        SavedFormat::id("l0b").round().quantise::<i16>(QA),
+        SavedFormat::id("l1w").round().quantise::<i8>(QB),
         SavedFormat::id("l1b"),
         SavedFormat::id("l2w"),
         SavedFormat::id("l2b"),
