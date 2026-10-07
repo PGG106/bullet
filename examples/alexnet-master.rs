@@ -43,17 +43,17 @@ use sfbinpack::chess::position::Position;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-const NET_NAME: &str = "fixedwdl";
+const NET_NAME: &str = "mostdata";
 const READ_BUF_MB: usize = 4096;
 const READ_THREADS: usize = 4;
 const MAP_THREADS: u8 = 2;
 const SAVE_RATE: usize = 80;
 const CHECKPOINT_PATH: &str = "checkpoints\\fixedwdl-stage1-800";
-const STAGE1_DATA_PATHS: [&str; 3] = [
+const STAGE1_DATA_PATHS: [&str; 4] = [
     "data/master.binpack",
     "data/test79-2022-03-mar-16tb7p.v6-dd.binpack",
     "data/test79-2022-04-apr-16tb7p.v6-dd.binpack",
-];
+    "data/test80-2024-01-jan-2tb7p.min-v2.v6.relabel.binpack"];
 const STAGE2_DATA_PATHS: [&str; 2] = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack"];
 const RUN_STAGE2: bool = false;
 
