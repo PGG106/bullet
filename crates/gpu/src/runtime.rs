@@ -118,6 +118,24 @@ impl<G: Gpu> Device<G> {
         self.sync()
     }
 
+    /// Allocate `bytes` amount of page-locked (pinned) host memory,
+    /// which allows host <-> device copies to be truly asynchronous
+    pub fn malloc_host(&self, bytes: usize) -> Result<*mut c_void, G::Error> {
+        self.set()?;
+        unsafe { G::host_malloc(bytes) }
+    }
+
+    /// Free the given pinned host pointer
+    ///
+    /// ### Safety
+    ///
+    /// User must ensure `ptr` was returned by `malloc_host` with the same
+    /// number of `bytes`, and is not in use by any queued operations
+    pub unsafe fn free_host(&self, ptr: *mut c_void, bytes: usize) -> Result<(), G::Error> {
+        self.set()?;
+        unsafe { G::host_free(ptr, bytes) }
+    }
+
     /// Memset the given number of `bytes` starting at `ptr` to `value`
     ///
     /// ### Safety
@@ -295,6 +313,14 @@ impl<G: Gpu> Module<G> {
         if let Some(arch) = device.props().arch() {
             let s = format!("--gpu-architecture={arch}");
             options.push(CString::new(s).unwrap())
+        }
+
+        if device.props().is_rocm() {
+            options.push(CString::new("-munsafe-fp-atomics").unwrap());
+
+            if let Ok(name) = std::env::var("GCN_ARCH_NAME") {
+                options.push(CString::new(format!("--offload-arch={name}")).unwrap());
+            }
         }
 
         let mut options_ptrs = Vec::new();

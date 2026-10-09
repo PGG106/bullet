@@ -15,8 +15,32 @@ pub fn tystr(dtype: DType) -> &'static str {
     }
 }
 
+/// Source literal for `value`, bit casting non-finite floats
+/// because `inf`/`NaN` are not valid literals.
+fn literal(value: DValue, dialect: Dialect) -> String {
+    match value {
+        DValue::F32(x) if x.is_finite() => format!("{x:E}"),
+        DValue::F32(x) => match dialect {
+            Dialect::CudaHip => format!("__int_as_float({:#x})", x.to_bits()),
+            Dialect::Msl => format!("as_type<float>({:#x}u)", x.to_bits()),
+        },
+        DValue::I32(x) => x.to_string(),
+    }
+}
+
 pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<String> {
     let dialect = props.dialect();
+
+    // A whole wave processes one position when its row count is wave-aligned.
+    // Tell AMD's compiler that the sparse-index address is uniform so it can
+    // use scalar loads instead of repeating the same load in every lane.
+    let batch_index = |rows: usize| {
+        if props.is_rocm() && props.warp_size().is_some_and(|warp| rows.is_multiple_of(usize::from(warp))) {
+            format!("int UNIQ1 = __builtin_amdgcn_readfirstlane(IN3 / {rows});")
+        } else {
+            format!("int UNIQ1 = IN3 / {rows};")
+        }
+    };
 
     match op {
         PointwiseOp::Buffer { .. } => None,
@@ -36,10 +60,7 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
         }
         PointwiseOp::ConditionalRead(io, value) => {
             let ty = tystr(io.buf_ty);
-            let vl = match value {
-                DValue::F32(x) => format!("{x:E}"),
-                DValue::I32(x) => x.to_string(),
-            };
+            let vl = literal(value, dialect);
 
             if io.p2size == 0 {
                 Some(format!("const {ty} OUT1 = IN3 > 0 ? IN1[IN2] : {vl};"))
@@ -82,10 +103,7 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
         }
         PointwiseOp::Constant { value, p2size } => {
             let ty = tystr(value.dtype());
-            let vl = match value {
-                DValue::F32(x) => format!("{x:E}"),
-                DValue::I32(x) => x.to_string(),
-            };
+            let vl = literal(value, dialect);
 
             match p2size {
                 0 => Some(format!("const {ty} OUT1 = {vl};")),
@@ -166,6 +184,10 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
             }
         }
         PointwiseOp::Unary { ty, p2size, op } => {
+            // the declared type follows the op's output type, which matches the
+            // input for everything but a cast; `opstr` still compares against
+            // zero in the input type
+            let out = tystr(if let Unary::Cast(cast) = op { cast } else { ty });
             let ty = tystr(ty);
 
             let opstr = |x: &str| match op {
@@ -195,6 +217,7 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
                         Unary::Sqrt => ["sqrtf", "sqrt"][mslidx],
                         Unary::Round => ["roundf", "round"][mslidx],
                         Unary::Truncate => ["truncf", "trunc"][mslidx],
+                        Unary::Identity => "",
                         Unary::Sgn | Unary::Reciprocal | Unary::IsPositive | Unary::IsZero | Unary::IsNonNegative => {
                             unimplemented!()
                         }
@@ -205,10 +228,10 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
             };
 
             match p2size {
-                0 => Some(format!("const {ty} OUT1 = {};", opstr("IN1"))),
-                1 => Some(format!("{ty}2 OUT1;\nOUT1.x = {};\nOUT1.y = {};", opstr("IN1.x"), opstr("IN1.y"),)),
+                0 => Some(format!("const {out} OUT1 = {};", opstr("IN1"))),
+                1 => Some(format!("{out}2 OUT1;\nOUT1.x = {};\nOUT1.y = {};", opstr("IN1.x"), opstr("IN1.y"),)),
                 2 => Some(format!(
-                    "{ty}4 OUT1;\nOUT1.x = {};\nOUT1.y = {};\nOUT1.z = {};\nOUT1.w = {};",
+                    "{out}4 OUT1;\nOUT1.x = {};\nOUT1.y = {};\nOUT1.z = {};\nOUT1.w = {};",
                     opstr("IN1.x"),
                     opstr("IN1.y"),
                     opstr("IN1.z"),
@@ -223,14 +246,15 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
                 0 => Some(format!(
                     "\
                     {ty} OUT1 = 0;
-                    int UNIQ1 = IN3 / {rows};
+                    {}
                     int UNIQ2 = {offset} + IN3 % {rows};
 
                     for (int i = 0; i < {nnz}; i++) {{
                         const int j = IN2[{nnz} * UNIQ1 + i];
                         if (j < 0 || j >= {cols}) break;
                         OUT1 += IN1[j * {stride} + UNIQ2];
-                    }}"
+                    }}",
+                    batch_index(rows)
                 )),
                 1 => {
                     assert_eq!(rows % 2, 0);
@@ -244,7 +268,7 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
                     Some(format!(
                         "\
                         {ty}2 OUT1 = {zero_vec};
-                        int UNIQ1 = IN3 / {m};
+                        {}
                         int UNIQ2 = {o} + IN3 % {m};
 
                         for (int i = 0; i < {nnz}; i++) {{
@@ -256,7 +280,8 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
 
                             OUT1.x += a.x;
                             OUT1.y += a.y;
-                        }}"
+                        }}",
+                        batch_index(m)
                     ))
                 }
                 2 => {
@@ -271,7 +296,7 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
                     Some(format!(
                         "\
                         {ty}4 OUT1 = {zero_vec};
-                        int UNIQ1 = IN3 / {m};
+                        {}
                         int UNIQ2 = {o} + IN3 % {m};
 
                         for (int i = 0; i < {nnz}; i++) {{
@@ -285,7 +310,8 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
                             OUT1.y += a.y;
                             OUT1.z += a.z;
                             OUT1.w += a.w;
-                        }}"
+                        }}",
+                        batch_index(m)
                     ))
                 }
                 3.. => None,
@@ -294,7 +320,7 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
         PointwiseOp::SpMMT { nnz, rows, cols, stride, offset, .. } => Some(format!(
             "\
                     if (IN4 != 0) {{
-                        int UNIQ1 = IN3 / {rows};
+                        {}
                         int UNIQ2 = {offset} + IN3 % {rows};
 
                         for (int i = 0; i < {nnz}; i++) {{
@@ -303,6 +329,7 @@ pub fn code_str(op: PointwiseOp, size: Size, props: &DeviceProps) -> Option<Stri
                             {}
                         }}
                     }}",
+            batch_index(rows),
             dialect.atomic_add(&format!("IN1 + j * {stride} + UNIQ2"), "IN4")
         )),
     }

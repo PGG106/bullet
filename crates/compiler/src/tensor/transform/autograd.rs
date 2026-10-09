@@ -30,7 +30,7 @@ impl IRTransform for LowerForward {
 
 type GradientMap = BTreeMap<NodeId, NodeId>;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TakeGradient {
     root: OpId,
     output_grads: Vec<NodeId>,
@@ -48,7 +48,10 @@ impl IRTransform for TakeGradient {
     fn apply(&self, ir: &mut TensorIR) -> Result<(), IRTrace> {
         let mut registered = BTreeSet::new();
 
-        for out in ir.get_op(self.root)?.outputs().to_vec() {
+        // optimising may replace the root op, but its outputs survive
+        let root_outputs = ir.get_op(self.root)?.outputs().to_vec();
+
+        for &out in &root_outputs {
             if !ir.is_output(out) {
                 registered.insert(out);
                 ir.register_output(out);
@@ -68,9 +71,9 @@ impl IRTransform for TakeGradient {
             ir.unregister_output(out_grd);
         }
 
-        let ops = ir.get_dependent_ops_set(self.root)?;
+        let root = ir.get_parent_op(root_outputs[0])?;
+        let ops = ir.get_dependent_ops_set(root)?;
 
-        let root_outputs = ir.get_op(self.root)?.outputs().to_vec();
         let mut grads: BTreeMap<_, _> = root_outputs.into_iter().zip(self.output_grads.clone()).collect();
 
         for &op in &ops {
@@ -145,7 +148,7 @@ impl IRTransform for TakeGradient {
 mod tests {
     use crate::tensor::{
         DType, TType, TValue, TensorOp,
-        operation::{CABinaryOp, CopyOp, Input},
+        operation::{CABinaryOp, CopyOp, Input, Unary},
         transform::inline::InlineSubgraphs,
     };
 
@@ -211,6 +214,88 @@ mod tests {
         assert_eq!(ops.len(), 2);
         assert!(TensorOp::downcast_rc::<Input>(optys.next().unwrap()).is_some());
         assert!(TensorOp::downcast_rc::<CABinaryOp>(optys.next().unwrap()).is_some());
+
+        Ok(())
+    }
+
+    fn gradients(
+        inputs: &[Vec<f32>],
+        f: impl Fn(&mut TensorIR, &[NodeId]) -> Result<NodeId, IRTrace>,
+    ) -> Result<Vec<Vec<f32>>, IRTrace> {
+        let mut ir = TensorIR::default();
+
+        let nodes: Vec<_> = inputs.iter().map(|x| ir.add_input(TType::new(x.len(), DType::F32))).collect();
+        let y = f(&mut ir, &nodes)?;
+
+        let size = ir.get_node(y)?.ty().size().get();
+        let grad = ir.add_const(TValue::F32(vec![1.0; size]));
+
+        let (transform, grads) = TakeGradient::new(ir.get_parent_op(y)?, [grad]);
+        ir.transform(transform)?;
+        ir.transform(LowerForward)?;
+        ir.transform(InlineSubgraphs)?;
+
+        let grad_nodes: Vec<_> = nodes.iter().map(|x| *grads.borrow().get(x).unwrap()).collect();
+        for &g in &grad_nodes {
+            ir.register_output(g);
+        }
+
+        let seeds: BTreeMap<_, _> = nodes.iter().zip(inputs).map(|(&n, x)| (n, TValue::F32(x.clone()))).collect();
+        let mut outs = ir.evaluate(seeds)?.unwrap();
+
+        Ok(grad_nodes
+            .iter()
+            .map(|g| {
+                let TValue::F32(g) = outs.remove(g).unwrap() else { panic!() };
+                g
+            })
+            .collect())
+    }
+
+    #[test]
+    fn unary_gradients_match_finite_differences() -> Result<(), IRTrace> {
+        let xs = vec![-0.9, -0.3, 0.2, 0.7, 1.3];
+
+        for op in [Unary::Sin, Unary::Cos, Unary::Tan, Unary::Sinh, Unary::Cosh, Unary::Tanh, Unary::Exp] {
+            let grad = gradients(std::slice::from_ref(&xs), |ir, x| ir.add_unary(x[0], op))?.remove(0);
+
+            for (&x, g) in xs.iter().zip(grad) {
+                let f = |x: f32| op.evaluate(x.into()).unwrap().f32().unwrap();
+                let h = 1e-3;
+                let expected = (f(x + h) - f(x - h)) / (2.0 * h);
+                assert!((g - expected).abs() < 1e-2, "{op:?} at {x}: {g} vs {expected}");
+            }
+        }
+
+        let xs = vec![0.2, 0.7, 1.3, 4.0];
+        let grad = gradients(std::slice::from_ref(&xs), |ir, x| ir.add_unary(x[0], Unary::Sqrt))?.remove(0);
+        for (&x, g) in xs.iter().zip(grad) {
+            assert!((g - 0.5 / x.sqrt()).abs() < 1e-5, "Sqrt at {x}: {g}");
+        }
+
+        for op in [Unary::Round, Unary::Truncate] {
+            let grad = gradients(std::slice::from_ref(&xs), |ir, x| ir.add_unary(x[0], op))?.remove(0);
+            assert_eq!(grad, vec![0.0; xs.len()], "{op:?}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn max_min_gradients() -> Result<(), IRTrace> {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![3.0, 2.0, 1.0];
+
+        let g = gradients(&[a.clone(), b.clone()], |ir, x| ir.add_binary(x[0], x[1], CABinary::Max))?;
+        assert_eq!(g, vec![vec![0.0, 1.0, 1.0], vec![1.0, 0.0, 0.0]]);
+
+        let g = gradients(&[a.clone(), b.clone()], |ir, x| ir.add_binary(x[0], x[1], CABinary::Min))?;
+        assert_eq!(g, vec![vec![1.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]]);
+
+        for op in [CABinary::Max, CABinary::Min] {
+            let g = gradients(std::slice::from_ref(&a), |ir, x| ir.add_binary(x[0], x[0], op))?;
+            assert_eq!(g, vec![vec![1.0; 3]], "{op:?}(x, x)");
+        }
 
         Ok(())
     }

@@ -32,9 +32,25 @@ pub struct DeviceProps {
     pub(super) vec_atomics: bool,
     pub(super) arch: Option<String>,
     pub(super) dialect: Dialect,
+    pub(super) is_rocm: bool,
 }
 
 impl DeviceProps {
+    /// Props for codegen tests, so that kernel generation can be exercised for
+    /// every dialect without the corresponding device (or feature) being present.
+    #[cfg(test)]
+    pub(crate) fn testing(dialect: Dialect, warp_size: Option<u8>, is_rocm: bool) -> Self {
+        Self {
+            name: "testing".into(),
+            warp_size,
+            stream_mem_alloc: false,
+            vec_atomics: false,
+            arch: None,
+            dialect,
+            is_rocm,
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -57,6 +73,10 @@ impl DeviceProps {
 
     pub fn dialect(&self) -> Dialect {
         self.dialect
+    }
+
+    pub fn is_rocm(&self) -> bool {
+        self.is_rocm
     }
 }
 
@@ -96,6 +116,10 @@ pub trait GpuBindings: 'static {
     unsafe fn context_memcpy_d2h(dst: *mut c_void, src: Self::Ptr, bytes: usize) -> Result<(), Self::Err>;
 
     unsafe fn context_memcpy_h2d(dst: Self::Ptr, src: *const c_void, bytes: usize) -> Result<(), Self::Err>;
+
+    unsafe fn host_malloc(bytes: usize) -> Result<*mut c_void, Self::Err>;
+
+    unsafe fn host_free(ptr: *mut c_void, bytes: usize) -> Result<(), Self::Err>;
 
     unsafe fn stream_create() -> Result<Self::Stream, Self::Err>;
 

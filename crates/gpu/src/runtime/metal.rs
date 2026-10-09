@@ -110,6 +110,7 @@ impl GpuBindings for Metal {
                 vec_atomics: true,
                 arch: None,
                 dialect: Dialect::Msl,
+                is_rocm: false,
             })
         })
     }
@@ -174,6 +175,15 @@ impl GpuBindings for Metal {
         })?;
         std::ptr::copy_nonoverlapping(src as *const u8, dst_ptr as *mut u8, bytes);
         Ok(())
+    }
+
+    // Unified memory, so there is no need for pinning
+    unsafe fn host_malloc(bytes: usize) -> Result<*mut c_void, MetalError> {
+        super::mock::MockGpu::host_malloc(bytes).map_err(Into::into)
+    }
+
+    unsafe fn host_free(ptr: *mut c_void, bytes: usize) -> MetalResult {
+        super::mock::MockGpu::host_free(ptr, bytes).map_err(Into::into)
     }
 
     unsafe fn stream_create() -> Result<u64, MetalError> {
