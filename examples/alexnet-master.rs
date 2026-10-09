@@ -29,7 +29,7 @@ use bullet_trainer::{
         adam::{AdamW, AdamWParams},
     },
     reader::ReadMapLoader,
-    run::{DefaultDevice, TrainingSchedule, TrainingSteps, train},
+    run::{DefaultDevice, HostPool, TrainingSchedule, TrainingSteps, train},
 };
 use rand::{
     Rng, SeedableRng,
@@ -230,7 +230,7 @@ pub fn static_exchange_eval(pos: &Position, m: Move, threshold: i32) -> bool {
     occupied.set(to.index(), true);
 
     if m.mtype() == MoveType::EnPassant {
-        occupied.set((to.index() ^ 8), false);
+        occupied.set(to.index() ^ 8, false);
     }
 
     // after the move, it's the opponent's turn.
@@ -638,6 +638,7 @@ fn main() {
         output_buckets,
         wdl::ConstantWDL { value: 0.0 },
     );
+    let pool = HostPool::new(device.clone());
 
     // Keep this output with the checkpoint: it is the reference for the engine eval-matching test.
     for fen in [
@@ -660,7 +661,7 @@ fn main() {
         "8/Q6r/3qR1P1/b4p2/k7/3B4/1KN2n2/8 b - - 0 1",
     ] {
         let pos = format!("{fen} | 0 | 0.0").parse().unwrap();
-        let inputs = evaluator_mapper.map(&[pos], Default::default(), 1).to_device(&device).unwrap();
+        let inputs = evaluator_mapper.map(&pool, &[pos], Default::default(), 1).unwrap().to_device(&device).unwrap();
         let output = evaluator.evaluate(&inputs).unwrap().get("output").unwrap();
         let [eval] = output.to_host().unwrap().f32()[..] else { panic!() };
         println!("FEN: {fen}");
