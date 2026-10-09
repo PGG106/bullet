@@ -1,3 +1,7 @@
+#[path = "ti_inputs.rs"]
+mod ti_inputs;
+
+use std::sync::Arc;
 use std::{cell::RefCell, mem::MaybeUninit};
 
 use bullet_lib::{
@@ -43,10 +47,10 @@ use sfbinpack::chess::position::Position;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-const NET_NAME: &str = "mostdata";
-const READ_BUF_MB: usize = 4096;
-const READ_THREADS: usize = 4;
-const MAP_THREADS: u8 = 2;
+const NET_NAME: &str = "mostdata-ti";
+const READ_BUF_MB: usize = 8192;
+const READ_THREADS: usize = 8;
+const MAP_THREADS: u8 = 8;
 const SAVE_RATE: usize = 80;
 const CHECKPOINT_PATH: &str = "checkpoints\\fixedwdl-stage1-800";
 const STAGE1_DATA_PATHS: [&str; 4] = [
@@ -57,7 +61,7 @@ const STAGE1_DATA_PATHS: [&str; 4] = [
 const STAGE2_DATA_PATHS: [&str; 2] = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack"];
 const RUN_STAGE2: bool = false;
 
-const L1: usize = 1536;
+const L1: usize = 512;
 const CLIP: f32 = 1.98;
 const L2: usize = 16;
 const L3: usize = 32;
@@ -310,15 +314,53 @@ const NUM_OUTPUT_BUCKETS: usize = 8;
 
 const NUM_INPUT_BUCKETS: usize = get_num_buckets(&BUCKET_LAYOUT);
 
-type InputTy = (((SparseInput, SparseInput), SparseInput), DenseInput<f32>);
+fn build_bbs(pos: &bulletformat::ChessBoard) -> [u64; 8] {
+    let mut bbs = [0u64; 8];
+
+    for (pc, sq) in pos.into_iter() {
+        let bit = 1 << sq;
+        bbs[usize::from(pc & 8 > 0)] |= bit;
+        bbs[2 + usize::from(pc & 7)] |= bit;
+    }
+
+    bbs
+}
+
+#[derive(Clone)]
+struct ThreatInputs {
+    threats: Arc<ti_inputs::Threats>,
+}
+
+impl ThreatInputs {
+    fn new() -> Self {
+        Self { threats: Arc::new(ti_inputs::Threats::new()) }
+    }
+
+    fn num_inputs(&self) -> usize {
+        self.threats.num_inputs()
+    }
+
+    fn max_active(&self) -> usize {
+        self.threats.max_active()
+    }
+
+    fn map_features(&self, pos: &bulletformat::ChessBoard, on_stm: impl FnMut(usize), on_ntm: impl FnMut(usize)) {
+        let bbs = build_bbs(pos);
+        self.threats.map(bbs, on_stm, on_ntm);
+    }
+}
+
+// stm psqt, ntm psqt, stm threats, ntm threats, output buckets, targets
+type InputTy = (((((SparseInput, SparseInput), SparseInput), SparseInput), SparseInput), DenseInput<f32>);
 
 fn make_inputs_mapper(
     inputs: &ModelInputs<InputTy>,
     feature_getter: ChessBucketsMirrored,
+    threats: ThreatInputs,
     output_buckets: CJBucket,
     wdl: impl WdlScheduler,
 ) -> ModelInputsMapper<bulletformat::ChessBoard> {
-    ModelInputsMapper::build(inputs, move |pos, step, (((stm, ntm), bucket), target)| {
+    ModelInputsMapper::build(inputs, move |pos, step, (((((stm, ntm), stm_t), ntm_t), bucket), target)| {
         let mut count = 0;
         feature_getter.map_features(pos, |stm_feature, ntm_feature| {
             stm[count] = stm_feature.try_into().unwrap();
@@ -330,6 +372,31 @@ fn make_inputs_mapper(
         if count < feature_getter.max_active() {
             stm[count] = -1;
             ntm[count] = -1;
+        }
+
+        let mut stm_cnt = 0;
+        let mut ntm_cnt = 0;
+        threats.map_features(
+            pos,
+            |f| {
+                stm_t[stm_cnt] = f.try_into().unwrap();
+                stm_cnt += 1;
+            },
+            |f| {
+                ntm_t[ntm_cnt] = f.try_into().unwrap();
+                ntm_cnt += 1;
+            },
+        );
+
+        assert!(
+            stm_cnt <= threats.max_active() && ntm_cnt <= threats.max_active(),
+            "More threats provided than the specified maximum!"
+        );
+        if stm_cnt < threats.max_active() {
+            stm_t[stm_cnt] = -1;
+        }
+        if ntm_cnt < threats.max_active() {
+            ntm_t[ntm_cnt] = -1;
         }
 
         bucket[0] = i32::from(output_buckets.bucket(pos));
@@ -344,47 +411,61 @@ fn make_inputs_mapper(
 
 fn main() {
     let feature_getter = ChessBucketsMirrored::new(BUCKET_LAYOUT);
+    let threats = ThreatInputs::new();
     let output_buckets = CJBucket;
     let inputs = ModelInputs::default()
         .add_sparse("stm", (feature_getter.num_inputs(), 1), feature_getter.max_active())
         .add_sparse("nstm", (feature_getter.num_inputs(), 1), feature_getter.max_active())
+        .add_sparse("stm_threats", (threats.num_inputs(), 1), threats.max_active())
+        .add_sparse("ntm_threats", (threats.num_inputs(), 1), threats.max_active())
         .add_sparse("buckets", (NUM_OUTPUT_BUCKETS, 1), 1)
         .add_dense("targets", (1, 1));
 
-    let defn = ModelDefinition::build(&inputs, |builder, (((stm_inputs, ntm_inputs), output_buckets), target)| {
-        let l0f = builder.new_weights("l0f", Shape::new(L1, 768), InitSettings::Zeroed);
-        let expanded_factoriser = l0f.repeat(NUM_INPUT_BUCKETS);
+    let defn = ModelDefinition::build(
+        &inputs,
+        |builder, (((((stm_inputs, ntm_inputs), stm_threats), ntm_threats), output_buckets), target)| {
+            let l0f = builder.new_weights("l0f", Shape::new(L1, 768), InitSettings::Zeroed);
+            let expanded_factoriser = l0f.repeat(NUM_INPUT_BUCKETS);
 
-        // input layer weights
-        let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, L1);
-        l0.init_with_effective_input_size(32);
-        l0.weights = (l0.weights + expanded_factoriser).clip_pass_through_grad(-CLIP, CLIP);
+            // PSQT weights only; l0t supplies the combined accumulator bias.
+            let l0 = builder.new_weights(
+                "l0w",
+                Shape::new(L1, 768 * NUM_INPUT_BUCKETS),
+                InitSettings::Normal { mean: 0.0, stdev: (2f32 / 32.0).sqrt() },
+            );
+            let l0 = (l0 + expanded_factoriser).clip_pass_through_grad(-CLIP, CLIP);
 
-        // output layer weights
-        let l1 = builder.new_affine("l1", L1, NUM_OUTPUT_BUCKETS * L2);
-        let l2 = builder.new_affine("l2", L2 * 2, NUM_OUTPUT_BUCKETS * L3);
-        let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
+            // threat input weights, summed with the psqt part before the activation
+            let l0t = builder.new_affine("l0t", threats.num_inputs(), L1);
 
-        let ft = |input, start, end| l0.slice(start, end).forward(input).crelu();
-        let stm_hidden = ft(stm_inputs, 0, L1 / 2) * ft(stm_inputs, L1 / 2, L1);
-        let ntm_hidden = ft(ntm_inputs, 0, L1 / 2) * ft(ntm_inputs, L1 / 2, L1);
+            // output layer weights
+            let l1 = builder.new_affine("l1", L1, NUM_OUTPUT_BUCKETS * L2);
+            let l2 = builder.new_affine("l2", L2 * 2, NUM_OUTPUT_BUCKETS * L3);
+            let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
 
-        let hl1 = stm_hidden.concat(ntm_hidden);
+            let ft = |psqt, thr, start, end| {
+                (l0.slice_rows(start, end).matmul(psqt) + l0t.slice(start, end).forward(thr)).crelu()
+            };
+            let stm_hidden = ft(stm_inputs, stm_threats, 0, L1 / 2) * ft(stm_inputs, stm_threats, L1 / 2, L1);
+            let ntm_hidden = ft(ntm_inputs, ntm_threats, 0, L1 / 2) * ft(ntm_inputs, ntm_threats, L1 / 2, L1);
 
-        let ones_l1_vec = builder.new_constant(Shape::new(1, L1), &[1.0 / L1 as f32; L1]);
-        let l0_out_norm = ones_l1_vec.matmul(hl1);
+            let hl1 = stm_hidden.concat(ntm_hidden);
 
-        let l1_out = l1.forward(hl1).select(output_buckets);
-        let hl2 = l1_out.concat(l1_out.abs_pow(2.0)).crelu();
+            let ones_l1_vec = builder.new_constant(Shape::new(1, L1), &[1.0 / L1 as f32; L1]);
+            let l0_out_norm = ones_l1_vec.matmul(hl1);
 
-        let hl3 = l2.forward(hl2).select(output_buckets).screlu();
-        let l3_out = l3.forward(hl3).select(output_buckets);
+            let l1_out = l1.forward(hl1).select(output_buckets);
+            let hl2 = l1_out.concat(l1_out.abs_pow(2.0)).crelu();
 
-        let loss = l3_out.sigmoid().power_error(target, 2.5);
-        let loss = loss + 0.004 * l0_out_norm;
+            let hl3 = l2.forward(hl2).select(output_buckets).screlu();
+            let l3_out = l3.forward(hl3).select(output_buckets);
 
-        (Some(loss.reduce_sum_batch()), vec![("output".to_string(), l3_out)])
-    });
+            let loss = l3_out.sigmoid().power_error(target, 2.5);
+            let loss = loss + 0.004 * l0_out_norm;
+
+            (Some(loss.reduce_sum_batch()), vec![("output".to_string(), l3_out)])
+        },
+    );
 
     let weights = ModelWeights::new(&defn, 198273612);
     let device = DefaultDevice::new(0).unwrap();
@@ -400,7 +481,7 @@ fn main() {
     let l0_clip = AdamWParams { min_weight: -CLIP / 2.0, max_weight: CLIP / 2.0, ..Default::default() };
     optimiser.set_params_for_weight("l0w", l0_clip);
     optimiser.set_params_for_weight("l0f", l0_clip);
-
+    optimiser.set_params_for_weight("l0tw", l0_clip);
 
     let saved_format = vec![
         SavedFormat::id("l0w")
@@ -410,7 +491,8 @@ fn main() {
             })
             .round()
             .quantise::<i16>(QA),
-        SavedFormat::id("l0b").round().quantise::<i16>(QA),
+        SavedFormat::id("l0tw").round().quantise::<i16>(QA),
+        SavedFormat::id("l0tb").round().quantise::<i16>(QA),
         SavedFormat::id("l1w").round().quantise::<i8>(QB),
         SavedFormat::id("l1b"),
         SavedFormat::id("l2w"),
@@ -418,8 +500,8 @@ fn main() {
         SavedFormat::id("l3w"),
         SavedFormat::id("l3b"),
     ];
-    
-    optimiser.load_from_checkpoint(&format!("{CHECKPOINT_PATH}\\optimiser_state")).unwrap();
+
+    // optimiser.load_from_checkpoint(&format!("{CHECKPOINT_PATH}\\optimiser_state")).unwrap();
 
     let mut run = |stage, start_superbatch, end_superbatch, lr_schedule, mapper, reader| {
         let error_record = RefCell::new(Vec::new());
@@ -482,7 +564,13 @@ fn main() {
         READ_THREADS,
         stage1_filter as fn(&TrainingDataEntry) -> bool,
     );
-    let mapper = make_inputs_mapper(&inputs, feature_getter, output_buckets, wdl::LinearWDL { start: 0.0, end: 0.15 });
+    let mapper = make_inputs_mapper(
+        &inputs,
+        feature_getter,
+        threats.clone(),
+        output_buckets,
+        wdl::LinearWDL { start: 0.0, end: 0.15 },
+    );
     run(
         1,
         1,
@@ -517,7 +605,13 @@ fn main() {
             READ_THREADS,
             stage2_filter as fn(&TrainingDataEntry) -> bool,
         );
-        let mapper = make_inputs_mapper(&inputs, feature_getter, output_buckets, wdl::ConstantWDL { value: 0.15 });
+        let mapper = make_inputs_mapper(
+            &inputs,
+            feature_getter,
+            threats.clone(),
+            output_buckets,
+            wdl::ConstantWDL { value: 0.15 },
+        );
         run(
             2,
             STAGE2_START_SUPERBATCH,
@@ -537,13 +631,33 @@ fn main() {
     }
 
     evaluator.load_device_weights(optimiser.weights()).unwrap();
-    let evaluator_mapper = make_inputs_mapper(&inputs, feature_getter, output_buckets, wdl::ConstantWDL { value: 0.0 });
+    let evaluator_mapper = make_inputs_mapper(
+        &inputs,
+        feature_getter,
+        threats.clone(),
+        output_buckets,
+        wdl::ConstantWDL { value: 0.0 },
+    );
+
+    // Keep this output with the checkpoint: it is the reference for the engine eval-matching test.
     for fen in [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
         "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
         "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
         "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/P2P2PP/rq2Q1R1K w kq - 0 2",
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR w KQkq - 0 1",
+        "3N4/b2R2p1/3q3r/6P1/4k1nQ/7B/8/K7 w - - 0 1",
+        "k2B1Q1q/8/b7/4p3/3Pr3/1N5R/2n5/1K6 w - - 0 1",
+        "1B3q2/8/r5n1/8/Rp1N1PQ1/8/4bk2/2K5 w - - 0 1",
+        "8/5NR1/5q1b/8/7p/3P2B1/6Q1/1k1K1n1r w - - 0 1",
+        "8/8/6r1/4B3/3Q3p/N1nq4/5RP1/b3K2k b - - 0 1",
+        "3qn2Q/1R6/8/1N3b1p/4B3/1kP5/r7/5K2 b - - 0 1",
+        "3rBR2/2qQ1p2/N7/2P2b2/6n1/k7/8/6K1 b - - 0 1",
+        "k7/8/p1rB1q2/7Q/4R3/2N2n2/7P/6bK b - - 0 1",
+        "2n2Rr1/Bk5p/N7/2Q3q1/b7/8/KP6/8 w - - 0 1",
+        "8/Q6r/3qR1P1/b4p2/k7/3B4/1KN2n2/8 b - - 0 1",
     ] {
         let pos = format!("{fen} | 0 | 0.0").parse().unwrap();
         let inputs = evaluator_mapper.map(&[pos], Default::default(), 1).to_device(&device).unwrap();
