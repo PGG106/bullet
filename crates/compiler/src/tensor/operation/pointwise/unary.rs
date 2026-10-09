@@ -23,13 +23,16 @@ pub enum Unary {
     IsNonNegative,
     Round,
     Truncate,
+    Identity,
 }
 
 impl Unary {
     pub fn dtype(self, input: DType) -> Option<DType> {
         match self {
             Self::Cast(ty) => Some(ty),
-            Self::Sgn | Self::Abs => Some(input),
+            Self::Sgn | Self::Abs | Self::Identity | Self::IsNonNegative | Self::IsPositive | Self::IsZero => {
+                Some(input)
+            }
             _ => (input != DType::I32).then_some(input),
         }
     }
@@ -50,6 +53,7 @@ impl Unary {
             Self::Sqrt => fp(|x| x.sqrt())?,
             Self::Round => fp(|x| x.round())?,
             Self::Truncate => fp(|x| x.trunc())?,
+            Self::Identity => input,
             Self::Sgn => match input {
                 DValue::F32(x) => DValue::F32(x.signum()),
                 DValue::I32(x) => DValue::I32(x.signum()),
@@ -152,18 +156,28 @@ impl OpType for UnaryOp {
                 -(x * x)?
             }
             Unary::Log => input.unary(Unary::Reciprocal),
-            Unary::Sgn | Unary::IsPositive | Unary::IsZero | Unary::IsNonNegative => {
+            Unary::Sinh => input.cosh(),
+            Unary::Cosh => input.sinh(),
+            Unary::Tanh => {
+                let t = input.tanh()?;
+                1.0 - (t * t)?
+            }
+            Unary::Tan => {
+                let t = input.tan()?;
+                1.0 + (t * t)?
+            }
+            Unary::Sqrt => 0.5 * input.unary(Unary::Sqrt)?.unary(Unary::Reciprocal)?,
+            Unary::Sgn | Unary::IsPositive | Unary::IsZero | Unary::IsNonNegative | Unary::Round | Unary::Truncate => {
                 let zero = DValue::zero(input.ty().dtype());
                 Ok(input.builder().scalar(zero, input.ty().size()))
             }
-            Unary::Cast(_) => Ok(grad),
-            Unary::Sinh | Unary::Cosh | Unary::Tanh | Unary::Tan | Unary::Truncate | Unary::Round | Unary::Sqrt => {
-                unimplemented!()
-            }
+            Unary::Cast(_) | Unary::Identity => Ok(grad),
         }?;
 
         if let Unary::Cast(_) = self.op() {
             grad.unary(Unary::Cast(self.input_type().dtype()))
+        } else if let Unary::Identity = self.op() {
+            Ok(grad)
         } else {
             grad * g
         }

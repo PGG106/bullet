@@ -62,6 +62,7 @@ impl GpuBindings for ROCm {
             vec_atomics: false,
             arch: None,
             dialect: Dialect::CudaHip,
+            is_rocm: true,
         })
     }
 
@@ -101,6 +102,16 @@ impl GpuBindings for ROCm {
 
     unsafe fn context_memset(dev_ptr: *mut c_void, bytes: usize, value: u8) -> ROCmResult {
         error::runtime(hipMemsetD8(dev_ptr, value, bytes))
+    }
+
+    unsafe fn host_malloc(bytes: usize) -> Result<*mut c_void, ROCmError> {
+        let mut ptr = std::ptr::null_mut();
+        error::runtime(hipHostMalloc(&mut ptr, bytes, hipHostMallocPortable))?;
+        Ok(ptr)
+    }
+
+    unsafe fn host_free(ptr: *mut c_void, _bytes: usize) -> ROCmResult {
+        error::runtime(hipHostFree(ptr))
     }
 
     unsafe fn stream_create() -> Result<hipStream, ROCmError> {
@@ -297,13 +308,8 @@ mod error {
             Ok(())
         } else {
             unsafe {
-                let mut name = std::ptr::null();
-                hipGetErrorName(value, &mut name);
-                let name = CStr::from_ptr(name).to_str().unwrap();
-
-                let mut desc = std::ptr::null();
-                hipGetErrorString(value, &mut desc);
-                let desc = CStr::from_ptr(desc).to_str().unwrap();
+                let name = CStr::from_ptr(hipGetErrorName(value)).to_str().unwrap();
+                let desc = CStr::from_ptr(hipGetErrorString(value)).to_str().unwrap();
 
                 Err(ROCmError::Driver(format!("{name}: {desc}")))
             }
@@ -357,12 +363,14 @@ mod raw {
     pub type hipModule = *mut Opaque;
     pub type hipDeviceAttribute = u32;
 
-    pub const hipDeviceAttributeWarpSize: u32 = 89;
+    pub const hipDeviceAttributeWarpSize: u32 = 87;
+
+    pub const hipHostMallocPortable: c_uint = 0x01;
 
     unsafe extern "C" {
         // Errors
-        pub fn hipGetErrorString(error: hipError, pStr: *mut *const c_char) -> hipError;
-        pub fn hipGetErrorName(error: hipError, pStr: *mut *const c_char) -> hipError;
+        pub fn hipGetErrorString(error: hipError) -> *const c_char;
+        pub fn hipGetErrorName(error: hipError) -> *const c_char;
 
         // Device
         pub fn hipSetDevice(device: c_int) -> hipError;
@@ -378,6 +386,8 @@ mod raw {
         pub fn hipMemsetD8(dstDevice: *mut c_void, uc: c_uchar, N: usize) -> hipError;
         pub fn hipMemcpyHtoD(dstDevice: *mut c_void, srcHost: *const c_void, ByteCount: usize) -> hipError;
         pub fn hipMemcpyDtoH(dstHost: *mut c_void, srcDevice: *mut c_void, ByteCount: usize) -> hipError;
+        pub fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> hipError;
+        pub fn hipHostFree(ptr: *mut c_void) -> hipError;
         pub fn hipMallocAsync(dptr: *mut *mut c_void, bytesize: usize, hStream: hipStream) -> hipError;
         pub fn hipFreeAsync(dptr: *mut c_void, hStream: hipStream) -> hipError;
         pub fn hipMemsetD8Async(dstDevice: *mut c_void, uc: c_uchar, N: usize, hStream: hipStream) -> hipError;

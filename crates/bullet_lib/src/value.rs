@@ -10,7 +10,7 @@ use bullet_trainer::{
     model::{ModelEvaluator, ModelInputs, ModelInputsMapper, SavedFormat},
     optimiser::{Optimiser, OptimiserState},
     reader::{DataReader, ReadMapLoader},
-    run::{self, Step, logger},
+    run::{self, HostPool, Step, logger},
 };
 
 use crate::{
@@ -163,7 +163,7 @@ where
             dataloader.clone(),
             schedule.eval_scale,
             schedule.wdl_scheduler.clone(),
-            settings.threads as u8,
+            settings.loader_threads(),
         );
 
         let _ = std::fs::create_dir(settings.output_directory);
@@ -183,10 +183,8 @@ where
                 loss_sum += error;
                 ticks_since_last += 1.0;
 
-                if step.batch().is_multiple_of(32)
-                    || (step.batches_per_superbatch() < 32 && step.batch() == step.batches_per_superbatch())
-                {
-                    let normalised_loss = loss_sum / f32::min(ticks_since_last, step.batches_per_superbatch() as f32);
+                if step.batch().is_multiple_of(32) || step.batch() + 1 == step.batches_per_superbatch() {
+                    let normalised_loss = loss_sum / ticks_since_last;
 
                     error_record.borrow_mut().push((step.superbatch(), step.batch(), normalised_loss));
 
@@ -196,7 +194,7 @@ where
             },
             |trainer, step| {
                 let superbatch = step.superbatch();
-                if superbatch % schedule.save_rate == 0 || superbatch == step.final_superbatch() {
+                if superbatch.is_multiple_of(schedule.save_rate) || superbatch == step.final_superbatch() {
                     let name = format!("{}-{superbatch}", schedule.net_id);
                     let path = format!("{}/{name}", settings.output_directory);
                     std::fs::create_dir(path.as_str()).unwrap_or(());
@@ -217,7 +215,8 @@ where
         let pos = format!("{fen} | 0 | 0.0").parse::<Inp::RequiredDataType>().unwrap();
 
         let mapper = self.state.make_mapper(1.0, wdl::ConstantWDL { value: 1.0 });
-        let host_data = mapper.map(&[pos], Step::default(), 1);
+        let pool = HostPool::new(self.optimiser.device());
+        let host_data = mapper.map(&pool, &[pos], Step::default(), 1).unwrap();
 
         let device_data = host_data.to_device(&self.optimiser.device()).unwrap();
 
@@ -265,7 +264,7 @@ where
             dataloader.clone(),
             schedule.eval_scale,
             schedule.wdl_scheduler.clone(),
-            settings.threads as u8,
+            settings.loader_threads(),
         );
 
         run::measure_max_cpu_throughput(dataloader, steps).unwrap()

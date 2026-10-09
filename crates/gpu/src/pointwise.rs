@@ -1,8 +1,9 @@
+mod builder;
 mod generate;
 mod ir;
 mod operations;
 pub(crate) mod transforms;
-mod write;
+pub(crate) mod write;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,7 +12,9 @@ use bullet_compiler::{
     tensor::{IRTrace, OpType, TType, TValue, TensorOp, operation::SubGraph},
 };
 
+pub use builder::{CoercesToPointwiseNode, PointwiseBuf, PointwiseBuilder, PointwiseNode};
 pub use ir::PointwiseIR;
+pub use operations::PType;
 
 use crate::runtime::DeviceProps;
 

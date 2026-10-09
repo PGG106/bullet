@@ -2,12 +2,12 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use bullet_compiler::{
     ir::IRError,
-    tensor::{DType, TType, TValue, operation::CABinary},
+    tensor::{DType, TType, TValue},
 };
 use bullet_gpu::{
     buffer::Buffer,
     kernel::{CompiledKernel, KernelSrc},
-    pointwise::PointwiseIR,
+    pointwise::PointwiseBuilder,
     runtime::{Device, DeviceProps, Gpu, Stream},
 };
 
@@ -21,24 +21,33 @@ use super::{
 };
 
 fn build_ranger_op(size: usize, alpha: f32, props: &DeviceProps) -> Result<KernelSrc, IRError> {
-    let mut pntwise = PointwiseIR::new(size.into())?;
+    let (builder, p2size) = PointwiseBuilder::vectorised(size);
 
-    let w = pntwise.add_buf(TType::new(size, DType::F32));
-    let s = pntwise.add_buf(TType::new(size, DType::F32));
-    let old_w = pntwise.read(w, pntwise.tid(), 0)?;
-    let old_s = pntwise.read(s, pntwise.tid(), 0)?;
+    let w = builder.new_buffer(TType::new(size, DType::F32));
+    let s = builder.new_buffer(TType::new(size, DType::F32));
 
-    let wweight = pntwise.add_const(alpha.into(), 0);
-    let lhs = pntwise.binary(wweight, old_w, CABinary::Mul)?;
+    let tid = builder.tid();
+    let old_w = w.read(tid, p2size);
+    let old_s = s.read(tid, p2size);
 
-    let sweight = pntwise.add_const((1.0 - alpha).into(), 0);
-    let rhs = pntwise.binary(sweight, old_s, CABinary::Mul)?;
+    let new_w = alpha * old_w + (1.0 - alpha) * old_s;
 
-    let new_w = pntwise.binary(lhs, rhs, CABinary::Add)?;
-    pntwise.write(w, pntwise.tid(), new_w)?;
-    pntwise.write(s, pntwise.tid(), new_w)?;
+    w.write(tid, new_w);
+    s.write(tid, new_w);
 
-    unsafe { pntwise.lower("ranger".to_string(), props) }
+    unsafe { builder.inner().lower("ranger".to_string(), props) }
+}
+
+fn build_init_op(size: usize, props: &DeviceProps) -> Result<KernelSrc, IRError> {
+    let (builder, p2size) = PointwiseBuilder::vectorised(size);
+
+    let w = builder.new_buffer(TType::new(size, DType::F32));
+    let s = builder.new_buffer(TType::new(size, DType::F32));
+
+    let tid = builder.tid();
+    s.write(tid, w.read(tid, p2size));
+
+    unsafe { builder.inner().lower("ranger_init".to_string(), props) }
 }
 
 #[derive(Clone, Debug)]
@@ -57,9 +66,11 @@ impl<T: Default> Default for RangerLookaheadParams<T> {
 pub struct RangerLookahead<G: Gpu, S> {
     inner: S,
     slow_params: Arc<Buffer<G>>,
+    slow_initialised: bool,
     k: usize,
     step: usize,
     op: CompiledKernel<G>,
+    init_op: CompiledKernel<G>,
 }
 
 impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
@@ -68,7 +79,9 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
     fn new(device: &Arc<Device<G>>, size: usize, params: Self::Params) -> Result<Self, G::Error> {
         Ok(Self {
             op: build_ranger_op(size, params.alpha, device.props()).unwrap().compile(device.clone())?,
+            init_op: build_init_op(size, device.props()).unwrap().compile(device.clone())?,
             slow_params: Buffer::from_host(device, &TValue::F32(vec![0.0; size]))?,
+            slow_initialised: false,
             inner: S::new(device, size, params.inner.clone())?,
             k: params.k,
             step: 0,
@@ -85,6 +98,17 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
     ) -> OptimiserUpdateResult<'a, G> {
         let mut blocks = OptimiserUpdateSync::default();
 
+        // slow weights must start from the fast weights, not zero,
+        // otherwise the first sync scales every weight by `alpha`
+        if !self.slow_initialised {
+            blocks.push_kernel(self.init_op.execute(
+                stream.clone(),
+                vec![weights.clone()],
+                vec![self.slow_params.clone()],
+            )?);
+            self.slow_initialised = true;
+        }
+
         self.step += 1;
         blocks.extend_by(self.inner.update(stream, weights.clone(), grads, gradient_factor, learning_rate)?);
 
@@ -98,6 +122,7 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
     fn reset(&mut self) -> Result<(), G::Error> {
         self.inner.reset()?;
         self.step = 0;
+        self.slow_initialised = false;
         Ok(())
     }
 
@@ -116,6 +141,7 @@ impl<G: Gpu, S: OptimiserState<G>> OptimiserState<G> for RangerLookahead<G, S> {
         for (id, par) in slow_params {
             let single = map.get_mut(&id).unwrap();
             single.slow_params.copy_from_host(&TValue::F32(par))?;
+            single.slow_initialised = true;
         }
 
         let mut map = map.iter_mut().map(|(id, single)| (id.clone(), &mut single.inner)).collect();
