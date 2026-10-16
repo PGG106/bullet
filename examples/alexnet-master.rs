@@ -1,7 +1,6 @@
-#[path = "ti_inputs.rs"]
-mod ti_inputs;
+#[path = "advanced/inputs.rs"]
+mod inputs;
 
-use std::sync::Arc;
 use std::{cell::RefCell, mem::MaybeUninit};
 
 use bullet_lib::{
@@ -47,12 +46,12 @@ use sfbinpack::chess::position::Position;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-const NET_NAME: &str = "mostdata-ti";
-const READ_BUF_MB: usize = 8192;
+const NET_NAME: &str = "mostdata-tipp768";
+const READ_BUF_MB: usize = 4096;
 const READ_THREADS: usize = 8;
 const MAP_THREADS: u8 = 8;
 const SAVE_RATE: usize = 80;
-const CHECKPOINT_PATH: &str = "checkpoints\\fixedwdl-stage1-800";
+const CHECKPOINT_PATH: &str = "checkpoints\\mostdata-ti-stage1-800";
 const STAGE1_DATA_PATHS: [&str; 4] = [
     "data/master.binpack",
     "data/test79-2022-03-mar-16tb7p.v6-dd.binpack",
@@ -61,7 +60,7 @@ const STAGE1_DATA_PATHS: [&str; 4] = [
 const STAGE2_DATA_PATHS: [&str; 2] = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack"];
 const RUN_STAGE2: bool = false;
 
-const L1: usize = 512;
+const L1: usize = 768;
 const CLIP: f32 = 1.98;
 const L2: usize = 16;
 const L3: usize = 32;
@@ -314,43 +313,30 @@ const NUM_OUTPUT_BUCKETS: usize = 8;
 
 const NUM_INPUT_BUCKETS: usize = get_num_buckets(&BUCKET_LAYOUT);
 
-fn build_bbs(pos: &bulletformat::ChessBoard) -> [u64; 8] {
-    let mut bbs = [0u64; 8];
-
-    for (pc, sq) in pos.into_iter() {
-        let bit = 1 << sq;
-        bbs[usize::from(pc & 8 > 0)] |= bit;
-        bbs[2 + usize::from(pc & 7)] |= bit;
-    }
-
-    bbs
-}
-
 #[derive(Clone)]
 struct ThreatInputs {
-    threats: Arc<ti_inputs::Threats>,
+    inner: inputs::PawnPawnInputs,
 }
 
 impl ThreatInputs {
     fn new() -> Self {
-        Self { threats: Arc::new(ti_inputs::Threats::new()) }
+        Self { inner: inputs::PawnPawnInputs::new(inputs::three_file_band_mask()) }
     }
 
     fn num_inputs(&self) -> usize {
-        self.threats.num_inputs()
+        self.inner.num_inputs()
     }
 
     fn max_active(&self) -> usize {
-        self.threats.max_active()
+        self.inner.max_active()
     }
 
     fn map_features(&self, pos: &bulletformat::ChessBoard, on_stm: impl FnMut(usize), on_ntm: impl FnMut(usize)) {
-        let bbs = build_bbs(pos);
-        self.threats.map(bbs, on_stm, on_ntm);
+        self.inner.map_features(pos, on_stm, on_ntm);
     }
 }
 
-// stm psqt, ntm psqt, stm threats, ntm threats, output buckets, targets
+// stm psqt, ntm psqt, stm threats+pp, ntm threats+pp, output buckets, targets
 type InputTy = (((((SparseInput, SparseInput), SparseInput), SparseInput), SparseInput), DenseInput<f32>);
 
 fn make_inputs_mapper(
@@ -435,7 +421,7 @@ fn main() {
             );
             let l0 = (l0 + expanded_factoriser).clip_pass_through_grad(-CLIP, CLIP);
 
-            // threat input weights, summed with the psqt part before the activation
+            // threat + pawn-pair input weights, summed with the psqt part before the activation
             let l0t = builder.new_affine("l0t", threats.num_inputs(), L1);
 
             // output layer weights
@@ -491,6 +477,7 @@ fn main() {
             })
             .round()
             .quantise::<i16>(QA),
+        // l0tw rows: pawn pairs 0..4560, then threats (59808)
         SavedFormat::id("l0tw").round().quantise::<i16>(QA),
         SavedFormat::id("l0tb").round().quantise::<i16>(QA),
         SavedFormat::id("l1w").round().quantise::<i8>(QB),
@@ -659,6 +646,9 @@ fn main() {
         "k7/8/p1rB1q2/7Q/4R3/2N2n2/7P/6bK b - - 0 1",
         "2n2Rr1/Bk5p/N7/2Q3q1/b7/8/KP6/8 w - - 0 1",
         "8/Q6r/3qR1P1/b4p2/k7/3B4/1KN2n2/8 b - - 0 1",
+        "1k6/pppppppp/8/8/8/8/PPPPPPPP/1K6 w - - 0 1",
+        "4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
+        "6k1/5ppp/8/3pP3/3Pp3/8/2PP1PPP/6K1 w - - 0 1",
     ] {
         let pos = format!("{fen} | 0 | 0.0").parse().unwrap();
         let inputs = evaluator_mapper.map(&pool, &[pos], Default::default(), 1).unwrap().to_device(&device).unwrap();
