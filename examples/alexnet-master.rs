@@ -25,7 +25,7 @@ use bullet_trainer::{
     },
     optimiser::{
         Optimiser,
-        adam::{AdamW, AdamWParams},
+        ranger::{Ranger, RangerParams},
     },
     reader::ReadMapLoader,
     run::{DefaultDevice, HostPool, TrainingSchedule, TrainingSteps, train},
@@ -46,17 +46,28 @@ use sfbinpack::chess::position::Position;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-const NET_NAME: &str = "mostdata-tipp768";
+const NET_NAME: &str = "mostdata-tipp768-BT4-full-ranger";
 const READ_BUF_MB: usize = 4096;
 const READ_THREADS: usize = 8;
 const MAP_THREADS: u8 = 8;
 const SAVE_RATE: usize = 80;
 const CHECKPOINT_PATH: &str = "checkpoints\\mostdata-ti-stage1-800";
-const STAGE1_DATA_PATHS: [&str; 4] = [
-    "data/master.binpack",
-    "data/test79-2022-03-mar-16tb7p.v6-dd.binpack",
-    "data/test79-2022-04-apr-16tb7p.v6-dd.binpack",
-    "data/test80-2024-01-jan-2tb7p.min-v2.v6.relabel.binpack"];
+const STAGE1_DATA_PATHS: [&str; 14] = [
+    "data/test80-2024-02-feb-2tb7p.min-v2.v6.relabel.binpack",
+    "data/test80-2024-01-jan-2tb7p.min-v2.v6.relabel.binpack",
+    "data/test80-2023-12-dec-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-11-nov-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-10-oct-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-09-sep-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-08-aug-2tb7p.v6.min.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-07-jul-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-06-jun-2tb7p.min-v2.v6.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-05-may-2tb7p.v6.min.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-04-apr-2tb7p.v6-sk16.min.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-03-mar-2tb7p.v6-sk16.min.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-02-feb-16tb7p.v6-dd.min.relabel-BT4-tf13tune.binpack",
+    "data/test80-2023-01-jan-16tb7p.v6-sk20.min.relabel-BT4-tf13tune.binpack",
+];
 const STAGE2_DATA_PATHS: [&str; 2] = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack"];
 const RUN_STAGE2: bool = false;
 
@@ -456,15 +467,16 @@ fn main() {
     let weights = ModelWeights::new(&defn, 198273612);
     let device = DefaultDevice::new(0).unwrap();
     let mut evaluator = ModelEvaluator::new(&defn, device.clone()).unwrap();
-    let mut optimiser = Optimiser::<_, AdamW<_>>::new(defn, weights, device.clone(), AdamWParams::default()).unwrap();
-    let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default() };
+    let mut optimiser =
+        Optimiser::<_, Ranger<_>>::new(defn, weights, device.clone(), RangerParams::default()).unwrap();
+    let no_clipping = RangerParams { min_weight: -128.0, max_weight: 128.0, ..Default::default() };
 
     optimiser.set_params_for_weight("l2w", no_clipping);
     optimiser.set_params_for_weight("l2b", no_clipping);
     optimiser.set_params_for_weight("l3w", no_clipping);
     optimiser.set_params_for_weight("l3b", no_clipping);
 
-    let l0_clip = AdamWParams { min_weight: -CLIP / 2.0, max_weight: CLIP / 2.0, ..Default::default() };
+    let l0_clip = RangerParams { min_weight: -CLIP / 2.0, max_weight: CLIP / 2.0, ..Default::default() };
     optimiser.set_params_for_weight("l0w", l0_clip);
     optimiser.set_params_for_weight("l0f", l0_clip);
     optimiser.set_params_for_weight("l0tw", l0_clip);
