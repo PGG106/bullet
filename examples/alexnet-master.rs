@@ -475,7 +475,7 @@ fn main() {
     optimiser.set_params_for_weight("l3w", no_clipping);
     optimiser.set_params_for_weight("l3b", no_clipping);
 
-    let l0_clip = RangerParams { min_weight: -CLIP / 2.0, max_weight: CLIP / 2.0, ..Default::default() };
+    let l0_clip = AdamWParams { min_weight: -CLIP / 2.0, max_weight: CLIP / 2.0, ..Default::default() };
     optimiser.set_params_for_weight("l0w", l0_clip);
     optimiser.set_params_for_weight("l0f", l0_clip);
     optimiser.set_params_for_weight("l0tw", l0_clip);
