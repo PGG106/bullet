@@ -25,7 +25,7 @@ use bullet_trainer::{
     },
     optimiser::{
         Optimiser,
-        ranger::{Ranger, RangerParams},
+        adam::{AdamW, AdamWParams},
     },
     reader::ReadMapLoader,
     run::{DefaultDevice, HostPool, TrainingSchedule, TrainingSteps, train},
@@ -46,7 +46,7 @@ use sfbinpack::chess::position::Position;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-const NET_NAME: &str = "mostdata-tipp768-BT4-full-ranger";
+const NET_NAME: &str = "mostdata-tipp768-BT4-full";
 const READ_BUF_MB: usize = 4096;
 const READ_THREADS: usize = 8;
 const MAP_THREADS: u8 = 8;
@@ -467,9 +467,8 @@ fn main() {
     let weights = ModelWeights::new(&defn, 198273612);
     let device = DefaultDevice::new(0).unwrap();
     let mut evaluator = ModelEvaluator::new(&defn, device.clone()).unwrap();
-    let mut optimiser =
-        Optimiser::<_, Ranger<_>>::new(defn, weights, device.clone(), RangerParams::default()).unwrap();
-    let no_clipping = RangerParams { min_weight: -128.0, max_weight: 128.0, ..Default::default() };
+    let mut optimiser = Optimiser::<_, AdamW<_>>::new(defn, weights, device.clone(), AdamWParams::default()).unwrap();
+    let no_clipping = AdamWParams { min_weight: -128.0, max_weight: 128.0, ..Default::default() };
 
     optimiser.set_params_for_weight("l2w", no_clipping);
     optimiser.set_params_for_weight("l2b", no_clipping);
