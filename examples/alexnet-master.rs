@@ -71,7 +71,7 @@ const STAGE1_DATA_PATHS: [&str; 14] = [
 const STAGE2_DATA_PATHS: [&str; 2] = ["data/master.binpack", "data/test79-2022-03-mar-16tb7p.v6-dd.binpack"];
 const RUN_STAGE2: bool = false;
 
-const L1: usize = 768;
+const L1: usize = 1024;
 const CLIP: f32 = 1.98;
 const L2: usize = 16;
 const L3: usize = 32;
